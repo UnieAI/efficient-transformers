@@ -2690,6 +2690,14 @@ class QEFFAutoModelForCausalLM(QEFFBaseModel):
             nlk = constants.ONNX_EXPORT_EXAMPLE_NLK  # Number of Logits to Keep
             example_inputs["num_logits_to_keep"] = torch.arange(nlk).view(nlk, 1)
             dynamic_axes["num_logits_to_keep"] = {0: "num_logits_to_keep"}
+        return_hidden_states = (
+            self.is_tlm
+            and self.model.qaic_config is not None
+            and self.model.qaic_config.get("return_hidden_states", False)
+        )
+        if return_hidden_states:
+            output_names.append("hidden_states")
+            dynamic_axes["hidden_states"] = {0: "batch_size", 1: "num_logits_to_keep"}
 
         if self.model.qaic_config is not None and self.model.qaic_config.get("include_sampler", False):
             example_inputs, output_names, dynamic_axes = get_sampling_inputs_and_outputs(
