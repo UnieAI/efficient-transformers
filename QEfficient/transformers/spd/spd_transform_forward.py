@@ -150,6 +150,6 @@ def tlm_forward(
         loss=None,
         logits=logits,
         past_key_values=outputs.past_key_values,
-        hidden_states=outputs.hidden_states,
+        hidden_states=hidden_states, # Return the specific filtered last hidden state
         attentions=outputs.attentions,
     )
