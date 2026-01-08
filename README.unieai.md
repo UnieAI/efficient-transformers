@@ -13,6 +13,7 @@
   - Target prefill chunking
   - PyTorch cold‑start 產生 initial KV
   - ORT/ONNX 的 Draft loop（可一次執行 K 步）
+  - QAIC QPC 的 on‑device Draft loop（`--eagle-on-device-loop` + `--eagle-use-cache`）
   - `eagle_cache_max_len` 截斷 cache
 
 ## How to Run (Draft Loop)
@@ -25,10 +26,22 @@ python examples/performance/speculative_decoding/eagle_inference.py \
   --num-speculative-tokens 4
 ```
 注意：Target 端需 QAIC 環境；Eagle 端使用 ONNX Runtime 執行。
+若使用 `--eagle-on-device-loop`（需搭配 `--eagle-use-cache`），Eagle loop 會編譯成 QPC 並在 QAIC 上執行（FP16）。
+
+## QAIC Smoke Check (Eagle Loop I/O)
+快速確認 QAIC 上的 Eagle loop I/O 形狀正確（不做完整驗證）：
+```bash
+python examples/performance/speculative_decoding/verify_eagle_loop_qaic.py \
+  --hidden-size 512 \
+  --num-heads 8 \
+  --num-steps 2 \
+  --past-len 1 \
+  --output-dir eagle_loop_qpc
+```
 
 ## Known Limitations
 - **Verify loop 尚未實作**：目前只完成 Draft 產生與輸出。
-- **On-device loop 為 ONNX unroll**：已移除 Python per‑token loop，但尚未整合 QAIC 控制流。
+- **On-device loop 有環境依賴**：需要 `qaic-exec` 與 QAIC runtime；cold‑start 仍使用 PyTorch 產生初始 KV。
 - **記憶體占用**：推論時會同時持有 PyTorch（cold‑start）與 ORT Session。
 
 ## Roadmap (原始規劃)
@@ -37,7 +50,7 @@ python examples/performance/speculative_decoding/eagle_inference.py \
 | Optimization | Eagle 3 (Current Focus) | Draft-based | Multi-Projection (Turbo) |
 | :--- | :--- | :--- | :--- |
 | **KV Cache** | ✅ Implemented | ✅ Supported (via QEfficient) | ❌ Not Applicable |
-| **On-Device Loop** | ✅ ONNX Unrolled | 🚀 **High Impact** | ❌ Not Applicable (Parallel) |
+| **On-Device Loop** | ✅ QAIC QPC Loop | 🚀 **High Impact** | ❌ Not Applicable (Parallel) |
 | **Tree Verification** | ⚡ **Advanced** | ⚠️ Optional (Complex) | 🚀 **High Impact** |
 
 ### 1. KV Cache Integration
@@ -51,6 +64,7 @@ python examples/performance/speculative_decoding/eagle_inference.py \
 - **Why**: 移除 Python per‑token overhead。  
 - **Benefit**: 大幅提高 throughput。  
 - **Status**: **Done**（已完成 ONNX Loop Unrolling 與 Inference 整合）。  
+- **補充**: **Done**（已支援 QAIC QPC on‑device loop 執行）。  
 
 ### 3. Tree Verification (Tree Speculative Decoding)
 **Target**: `Multi-Projection`, `Eagle 3`  

@@ -5,13 +5,16 @@
 #
 # -----------------------------------------------------------------------------
 
+import json
 import os
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional, Tuple
 
 import numpy as np
 import torch
 
+from QEfficient.compile.compile_helper import compile_kv_model_on_cloud_ai_100
 from QEfficient.transformers.spd.eagle import EagleConfig, EagleDraftLoop, EagleHead
 
 EAGLE_INPUT_IDS = "input_ids"
@@ -26,20 +29,19 @@ EAGLE_OUTPUT_PRESENT_KEY = "present_key"
 EAGLE_OUTPUT_PRESENT_VALUE = "present_value"
 
 
-
 def load_eagle_head(vocab_size=32000, hidden_size=2048, num_attention_heads=4, weights_path=None):
     """
     Load Eagle Head model.
     """
     config = EagleConfig(vocab_size, hidden_size, num_attention_heads)
     model = EagleHead(config, hidden_size)
-    
+
     if weights_path and os.path.exists(weights_path):
         print(f"Loading Eagle weights from {weights_path}")
         model.load_state_dict(torch.load(weights_path, map_location="cpu"))
     else:
         print("Initializing Eagle Head with random weights (Dummy Mode)")
-        
+
     model.eval()
     return model
 
@@ -59,14 +61,16 @@ def compile_eagle_head(
     hidden_size = model.hidden_size
     num_heads = model.num_heads
     head_dim = model.head_dim
-    onnx_path = os.path.join(output_dir, "eagle_head.onnx")
-    
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+    onnx_path = str(output_path / "eagle_head.onnx")
+
     print(f"Exporting Eagle Head to {onnx_path}...")
-    
+
     model = model.to(dtype)
     dummy_input_ids = torch.randint(0, model.config.vocab_size, (batch_size, seq_len), dtype=torch.int64)
     dummy_features = torch.randn(batch_size, seq_len, hidden_size, dtype=dtype)
-    
+
     if use_cache:
         dummy_past_key = torch.zeros(batch_size, num_heads, past_len, head_dim, dtype=dtype)
         dummy_past_value = torch.zeros(batch_size, num_heads, past_len, head_dim, dtype=dtype)
@@ -130,7 +134,9 @@ def compile_eagle_loop(
     hidden_size = model.hidden_size
     num_heads = model.num_heads
     head_dim = model.head_dim
-    onnx_path = os.path.join(output_dir, f"eagle_loop_{num_steps}.onnx")
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+    onnx_path = str(output_path / f"eagle_loop_{num_steps}.onnx")
 
     loop_model = EagleDraftLoop(model, num_steps=num_steps, use_cache=use_cache).to(dtype)
     dummy_input_ids = torch.randint(0, model.config.vocab_size, (batch_size, 1), dtype=torch.int64)
@@ -168,6 +174,7 @@ def compile_eagle_loop(
             EAGLE_LOOP_OUTPUT_HIDDEN: {0: "batch_size"},
         }
 
+    # ... existing code ...
     torch.onnx.export(
         loop_model,
         export_args,
@@ -178,6 +185,68 @@ def compile_eagle_loop(
         opset_version=14,
     )
     return onnx_path
+
+def compile_eagle_qpc(
+    onnx_path: str,
+    output_dir: str,
+    *,
+    batch_size: int = 1,
+    seq_len: int = 1,
+    past_len: int = 1,
+    total_len: int = 1,
+    num_cores: int = 2,
+    mxfp6: bool = True,
+    aic_enable_depth_first: bool = True,
+    allow_mxint8_mdp_io: bool = False,
+    device_group: Optional[list] = None,
+    custom_io: Optional[dict] = None,
+):
+    """
+    Compile Eagle ONNX to QAIC QPC.
+    """
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+    qaic_exec = Path("/opt/qti-aic/exec/qaic-exec")
+    if not qaic_exec.exists():
+        raise FileNotFoundError("qaic-exec not found at /opt/qti-aic/exec/qaic-exec.")
+    specializations_json = output_path / "specializations.json"
+    specialization = {"batch_size": str(batch_size)}
+    if seq_len is not None:
+        specialization["seq_len"] = str(seq_len)
+    if past_len is not None:
+        specialization["past_len"] = str(past_len)
+    if total_len is not None:
+        specialization["total_len"] = str(total_len)
+    specializations = {"specializations": [specialization]}
+    with open(specializations_json, "w") as fp:
+        json.dump(specializations, fp, indent=4)
+
+    if custom_io is None:
+        custom_io = {
+            EAGLE_INPUT_HIDDEN: "float16",
+            EAGLE_INPUT_PAST_KEY: "float16",
+            EAGLE_INPUT_PAST_VALUE: "float16",
+            EAGLE_LOOP_OUTPUT_HIDDEN: "float16",
+            EAGLE_OUTPUT_PRESENT_KEY: "float16",
+            EAGLE_OUTPUT_PRESENT_VALUE: "float16",
+        }
+    custom_io_yaml = output_path / "custom_io.yaml"
+    with open(custom_io_yaml, "w") as fp:
+        for io_name, dtype in custom_io.items():
+            fp.write(f" - IOName: {io_name}\n   Precision: {dtype}\n\n")
+
+    _, qpc_path = compile_kv_model_on_cloud_ai_100(
+        onnx_path=onnx_path,
+        specializations_json=str(specializations_json),
+        num_cores=num_cores,
+        base_path=str(output_path),
+        mxfp6=mxfp6,
+        custom_io_path=str(custom_io_yaml),
+        aic_enable_depth_first=aic_enable_depth_first,
+        allow_mxint8_mdp_io=allow_mxint8_mdp_io,
+        device_group=device_group,
+    )
+    return qpc_path
 
 
 def normalize_token_ids(token_ids: np.ndarray) -> np.ndarray:

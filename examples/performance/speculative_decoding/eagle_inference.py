@@ -29,6 +29,7 @@ from eagle_utils import (
     EagleFeatureCache,
     compile_eagle_head,
     compile_eagle_loop,
+    compile_eagle_qpc,
     load_eagle_head,
     normalize_hidden_states,
     normalize_token_ids,
@@ -92,8 +93,7 @@ def resolve_eagle_names(session: ort.InferenceSession):
     return input_ids_name, hidden_input, logits_output, hidden_output, past_key, past_value, present_key, present_value
 
 
-def resolve_eagle_loop_names(session: ort.InferenceSession):
-    output_names = [out.name for out in session.get_outputs()]
+def resolve_eagle_loop_names(output_names):
     token_output = EAGLE_LOOP_OUTPUT_TOKENS if EAGLE_LOOP_OUTPUT_TOKENS in output_names else output_names[0]
     hidden_output = EAGLE_LOOP_OUTPUT_HIDDEN if EAGLE_LOOP_OUTPUT_HIDDEN in output_names else None
     if hidden_output is None or hidden_output not in output_names:
@@ -116,6 +116,8 @@ def eagle_spec_decode_inference(
     eagle_use_cache=False,
     eagle_cache_max_len=None,
     eagle_on_device_loop=False,
+    eagle_loop_compile_dir="eagle_loop_qpc",
+    eagle_loop_num_cores=2,
 ):
     device_group = device_group or [0]
     print(f"Loading Target Model: {target_model_name}")
@@ -152,17 +154,23 @@ def eagle_spec_decode_inference(
         num_attention_heads=num_attention_heads,
         weights_path=eagle_weights_path,
     )
-    eagle_torch_dtype = torch.float16 if eagle_dtype == "fp16" else torch.float32
-    eagle_np_dtype = np.float16 if eagle_dtype == "fp16" else np.float32
     sess_options = ort.SessionOptions()
     sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
     use_cache = bool(eagle_use_cache)
     loop_steps = num_speculative_tokens
-    if eagle_on_device_loop and use_cache and num_speculative_tokens > 1:
-        loop_steps = num_speculative_tokens - 1
-    if eagle_on_device_loop and not use_cache:
-        print("On-device loop requires --eagle-use-cache; falling back to host loop.")
+    if eagle_on_device_loop:
+        if not use_cache:
+            print("On-device loop requires --eagle-use-cache; falling back to host loop.")
+        else:
+            loop_steps = max(num_speculative_tokens - 1, 0)
     use_device_loop = eagle_on_device_loop and use_cache and loop_steps > 0
+    if use_device_loop and eagle_dtype != "fp16":
+        print("On-device loop uses FP16 on QAIC; overriding --eagle-dtype to fp16.")
+        eagle_dtype = "fp16"
+
+    eagle_torch_dtype = torch.float16 if eagle_dtype == "fp16" else torch.float32
+    eagle_np_dtype = np.float16 if eagle_dtype == "fp16" else np.float32
+    eagle_model = eagle_model.to(eagle_torch_dtype)
 
     eagle_session = None
     eagle_loop_session = None
@@ -175,11 +183,21 @@ def eagle_spec_decode_inference(
             use_cache=use_cache,
             past_len=1,
         )
-        eagle_loop_session = ort.InferenceSession(eagle_loop_onnx_path, sess_options=sess_options)
-        loop_token_output, loop_hidden_output, loop_present_key, loop_present_value = resolve_eagle_loop_names(
-            eagle_loop_session
+        eagle_loop_qpc_path = compile_eagle_qpc(
+            eagle_loop_onnx_path,
+            output_dir=eagle_loop_compile_dir,
+            batch_size=1,
+            seq_len=1,
+            past_len=1,
+            total_len=loop_steps + 1,
+            num_cores=eagle_loop_num_cores,
+            device_group=device_group,
         )
-        loop_output_names = [out.name for out in eagle_loop_session.get_outputs()]
+        eagle_loop_session = QAICInferenceSession(eagle_loop_qpc_path, device_ids=device_group)
+        loop_output_names = eagle_loop_session.output_names
+        loop_token_output, loop_hidden_output, loop_present_key, loop_present_value = resolve_eagle_loop_names(
+            loop_output_names
+        )
         loop_tokens_index = loop_output_names.index(loop_token_output)
         loop_hidden_index = loop_output_names.index(loop_hidden_output)
         loop_present_key_index = (
@@ -288,20 +306,33 @@ def eagle_spec_decode_inference(
             if use_cache:
                 loop_inputs[EAGLE_INPUT_PAST_KEY] = past_key
                 loop_inputs[EAGLE_INPUT_PAST_VALUE] = past_value
-            loop_outs = eagle_loop_session.run(None, loop_inputs)
-            loop_tokens = loop_outs[loop_tokens_index]
-            loop_hidden = loop_outs[loop_hidden_index]
+
+            loop_outs = eagle_loop_session.run(loop_inputs)
+            if isinstance(loop_outs, dict):
+                loop_tokens = loop_outs[loop_token_output]
+                loop_hidden = loop_outs[loop_hidden_output]
+                if loop_present_key is not None and loop_present_key in loop_outs:
+                    past_key = loop_outs[loop_present_key]
+                if loop_present_value is not None and loop_present_value in loop_outs:
+                    past_value = loop_outs[loop_present_value]
+            else:
+                loop_tokens = loop_outs[loop_tokens_index]
+                loop_hidden = loop_outs[loop_hidden_index]
+                if loop_present_key_index is not None:
+                    past_key = loop_outs[loop_present_key_index]
+                if loop_present_value_index is not None:
+                    past_value = loop_outs[loop_present_value_index]
+
             if loop_tokens.ndim == 1:
                 loop_tokens = loop_tokens.reshape(1, -1)
+            loop_tokens = loop_tokens.astype(np.int64, copy=False)
+            loop_hidden = normalize_hidden_states(loop_hidden, dtype=eagle_np_dtype)
             draft_tokens.extend(loop_tokens[0].tolist())
             current_token = loop_tokens[:, -1:].astype(np.int64)
             current_feature = loop_hidden[:, -1:, :]
-            if use_cache and loop_present_key_index is not None and loop_present_value_index is not None:
-                past_key = loop_outs[loop_present_key_index]
-                past_value = loop_outs[loop_present_value_index]
-                if eagle_cache_max_len:
-                    past_key = past_key[:, :, -eagle_cache_max_len:, :]
-                    past_value = past_value[:, :, -eagle_cache_max_len:, :]
+            if use_cache and eagle_cache_max_len and past_key is not None and past_value is not None:
+                past_key = past_key[:, :, -eagle_cache_max_len:, :]
+                past_value = past_value[:, :, -eagle_cache_max_len:, :]
         elif remaining_steps > 0:
             if eagle_session is None:
                 raise RuntimeError("Eagle ONNX session is not available for host-side loop.")
@@ -359,6 +390,8 @@ if __name__ == "__main__":
     parser.add_argument("--eagle-use-cache", action="store_true")
     parser.add_argument("--eagle-cache-max-len", type=int, default=None)
     parser.add_argument("--eagle-on-device-loop", action="store_true")
+    parser.add_argument("--eagle-loop-compile-dir", type=str, default="eagle_loop_qpc")
+    parser.add_argument("--eagle-loop-num-cores", type=int, default=2)
     args = parser.parse_args()
 
     eagle_spec_decode_inference(
@@ -374,4 +407,6 @@ if __name__ == "__main__":
         eagle_use_cache=args.eagle_use_cache,
         eagle_cache_max_len=args.eagle_cache_max_len,
         eagle_on_device_loop=args.eagle_on_device_loop,
+        eagle_loop_compile_dir=args.eagle_loop_compile_dir,
+        eagle_loop_num_cores=args.eagle_loop_num_cores,
     )
