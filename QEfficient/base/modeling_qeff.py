@@ -355,6 +355,10 @@ class QEFFBaseModel(ABC):
             return self.prefill_onnx_path
         else:
             if self.onnx_path is None:
+                if specializations and isinstance(specializations, list):
+                    seq_len = specializations[0].get("seq_len")
+                    if seq_len is not None:
+                        kwargs["prefill_seq_len"] = seq_len
                 self.export(**kwargs)
             return self.onnx_path
 

@@ -7,6 +7,7 @@
 
 
 from collections.abc import Iterable
+import inspect
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
@@ -307,11 +308,18 @@ class QEffDynamicCache(DynamicCache):
     """
 
     def __init__(self, ddp_cache_data: Optional[Iterable[tuple[torch.Tensor, torch.Tensor]]] = None, *args, **kwargs):
-        # Remove layer_classes if present to avoid duplicate argument
+        # Remove legacy args if present to avoid duplicate argument
         kwargs.pop("layer_classes", None)
         from transformers.cache_utils import Cache  # Import here to avoid circular import
-
-        Cache.__init__(self, layer_classes=QEffDynamicLayer, *args, **kwargs)
+        cache_init_params = inspect.signature(Cache.__init__).parameters
+        if "layer_class_to_replicate" in cache_init_params:
+            Cache.__init__(self, layer_class_to_replicate=QEffDynamicLayer, *args, **kwargs)
+        elif "layer_classes" in cache_init_params:
+            Cache.__init__(self, layer_classes=QEffDynamicLayer, *args, **kwargs)
+        elif "layer_class" in cache_init_params:
+            Cache.__init__(self, layer_class=QEffDynamicLayer, *args, **kwargs)
+        else:
+            Cache.__init__(self, *args, **kwargs)
         if ddp_cache_data is not None:
             for key_states, value_states in ddp_cache_data:
                 self.layers.append(QEffDynamicLayer.from_tensors(key_states, value_states))
@@ -349,6 +357,10 @@ class QEffDynamicCache(DynamicCache):
             A tuple containing the updated key and value states.
         """
         return self.layers[layer_idx].read_only_blockedKV(start_index, end_index, cache_kwargs)
+
+    def get_seq_length(self, layer_idx: Optional[int] = 0, cache_position: Optional[torch.Tensor] = None) -> int:
+        # `cache_position` is ignored; keep compatibility with newer HF signatures.
+        return super().get_seq_length(layer_idx=layer_idx)
 
     def write_only(self, key_states, value_states, layer_idx, cache_kwargs):
         """

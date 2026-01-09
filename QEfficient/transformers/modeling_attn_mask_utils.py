@@ -21,6 +21,8 @@ def _create_causal_mask(
         - Create a causal 4d mask
         - Create a causal 4d mask with slided window
     """
+    if target_length == 0:
+        target_length = position_ids.shape[-1] if position_ids.numel() > 0 else 0
     if sliding_window is not None:
         query_indices = position_ids.unsqueeze(-1)
         kv_indices = torch.arange(target_length).view(1, -1)

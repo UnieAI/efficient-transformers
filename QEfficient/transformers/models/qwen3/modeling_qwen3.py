@@ -163,7 +163,15 @@ class QEffQwen3Attention(Qwen3Attention):
         key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
         value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
-        kv_seq_len = past_key_value.get_seq_length(self.layer_idx, cache_position)
+        kv_seq_len = past_key_value.get_seq_length(self.layer_idx, cache_position) if past_key_value is not None else 0
+        if kv_seq_len == 0:
+            if cache_position is not None and cache_position.numel() > 0:
+                kv_seq_len = int(cache_position.max().item()) + 1
+            elif position_ids is not None and position_ids.numel() > 0:
+                max_pos = position_ids.max().item()
+                kv_seq_len = int(max_pos) + 1 if max_pos >= 0 else value_states.shape[2]
+            else:
+                kv_seq_len = value_states.shape[2]
         cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
         query_states, key_states = qeff_apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
@@ -175,6 +183,9 @@ class QEffQwen3Attention(Qwen3Attention):
             key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
         attention_interface = eager_attention_forward
+
+        if attention_mask is not None:
+            attention_mask = _create_causal_mask(position_ids=position_ids, target_length=key_states.shape[-2])
 
         attn_output, attn_weights = attention_interface(
             self,
@@ -302,9 +313,8 @@ class QEffQwen3Model(Qwen3Model):
         if position_ids is None:
             position_ids = cache_position.unsqueeze(0)
 
-        target_length = attention_mask.shape[-1] if isinstance(attention_mask, torch.Tensor) else past_seen_tokens
         causal_mask = _create_causal_mask(
-            position_ids=position_ids, target_length=target_length, sliding_window=self.config.sliding_window
+            position_ids=position_ids, target_length=past_seen_tokens, sliding_window=self.config.sliding_window
         )
 
         hidden_states = inputs_embeds

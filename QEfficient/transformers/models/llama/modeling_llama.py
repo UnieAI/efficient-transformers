@@ -227,6 +227,14 @@ class QEffLlamaAttention(LlamaAttention):
         value_states = self.v_proj(hidden_states, **kwargs).view(hidden_shape).transpose(1, 2)
 
         kv_seq_len = past_key_value.get_seq_length(self.layer_idx, cache_position)
+        if kv_seq_len == 0:
+            if cache_position is not None and cache_position.numel() > 0:
+                kv_seq_len = int(cache_position.max().item()) + 1
+            elif position_ids is not None and position_ids.numel() > 0:
+                max_pos = position_ids.max().item()
+                kv_seq_len = int(max_pos) + 1 if max_pos >= 0 else value_states.shape[2]
+            else:
+                kv_seq_len = value_states.shape[2]
         past_seen_tokens = past_key_value.get_seq_length() if past_key_value is not None else 0
         cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
         query_states, key_states = qeff_apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
@@ -250,6 +258,9 @@ class QEffLlamaAttention(LlamaAttention):
             attention_interface = eager_attention_forward_blockedKV
         else:
             attention_interface = eager_attention_forward
+
+        if attention_mask is not None:
+            attention_mask = _create_causal_mask(position_ids=position_ids, target_length=key_states.shape[-2])
 
         attn_output, attn_weights = attention_interface(
             self,

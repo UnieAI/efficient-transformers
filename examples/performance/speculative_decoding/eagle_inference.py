@@ -287,7 +287,7 @@ def eagle_spec_decode_inference(
         eagle_output_names = eagle_session.output_names
 
     print(f"Starting Inference on {len(prompts)} prompts...")
-    vocab_size = len(tokenizer)
+    vocab_size = getattr(model_config, "vocab_size", len(tokenizer))
     hidden_dtype = get_binding_dtype(target_session, "hidden_states")
     logits_dtype = get_binding_dtype(target_session, "logits")
     target_session.set_buffers(

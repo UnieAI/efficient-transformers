@@ -90,7 +90,7 @@ cache_dir
 qeff_models
 .vscode/*
 
-models/
+models/JKroller
 eagle_artifacts/
 eagle_head_qpc/
 eagle_loop_qpc/
