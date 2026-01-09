@@ -130,8 +130,10 @@ def eagle_spec_decode_inference(
     prefill_seq_len=128,
     ctx_len=512,
     device_group=None,
+    eagle_device_group=None,
     target_num_cores=14,
     eagle_num_cores=2,
+    max_tokens=64,
     eagle_window=1,
     eagle_dtype="fp32",
     eagle_use_cache=False,
@@ -140,7 +142,7 @@ def eagle_spec_decode_inference(
 ):
     device_group = device_group or [0]
     target_device_group = device_group
-    eagle_device_group = device_group
+    eagle_device_group = eagle_device_group or target_device_group
     print(f"Loading Target Model: {target_model_name}")
     tokenizer = AutoTokenizer.from_pretrained(target_model_name)
     if tokenizer.pad_token_id is None:
@@ -312,109 +314,193 @@ def eagle_spec_decode_inference(
 
         current_token = target_logits.argmax(2).astype(np.int64)
         current_feature = select_last_hidden_states(target_hidden)
+        generated_ids = [current_token.item()]
+        position_cursor = input_len + 1
+        total_draft_tokens = 0
+        accepted_draft_tokens = 0
+        verified_token_count = 0
 
         cache = EagleFeatureCache(max_len=eagle_window)
         cache.append(current_token, current_feature, dtype=eagle_np_dtype)
         past_key = None
         past_value = None
-        draft_tokens = []
-        remaining_steps = num_speculative_tokens
-        if use_cache and remaining_steps > 0:
-            empty_past = np.zeros(
-                (1, eagle_model.num_heads, 1, eagle_model.head_dim), dtype=eagle_np_dtype
-            )
-            if use_device_loop:
-                past_key = empty_past
-                past_value = empty_past
-            else:
-                if eagle_session is None:
-                    raise RuntimeError("Eagle QPC session is not available for host-side cache warmup.")
+        empty_past = np.zeros((1, eagle_model.num_heads, 1, eagle_model.head_dim), dtype=eagle_np_dtype)
+
+        while len(generated_ids) < max_tokens:
+            verify_seed_token = current_token.copy()
+            draft_tokens = []
+            remaining_steps = num_speculative_tokens
+            if use_cache and remaining_steps > 0:
+                if use_device_loop:
+                    if past_key is None or past_value is None:
+                        past_key = empty_past
+                        past_value = empty_past
+                else:
+                    if past_key is None or past_value is None:
+                        if eagle_session is None:
+                            raise RuntimeError("Eagle QPC session is not available for host-side cache warmup.")
+                        step_tokens = normalize_token_ids(current_token)
+                        step_features = normalize_hidden_states(current_feature, dtype=eagle_np_dtype)
+                        eagle_inputs = {
+                            eagle_input_ids: step_tokens,
+                            eagle_hidden_input: step_features,
+                            eagle_past_key: empty_past,
+                            eagle_past_value: empty_past,
+                        }
+                        eagle_outs = eagle_session.run(None, eagle_inputs)
+                        logits = eagle_outs[eagle_logits_index]
+                        next_hidden = eagle_outs[eagle_hidden_index]
+                        next_token = np.argmax(logits[:, -1:, :], axis=-1).astype(np.int64)
+                        next_feature = next_hidden[:, -1:, :]
+                        draft_tokens = [next_token.item()]
+                        past_key = eagle_outs[present_key_index]
+                        past_value = eagle_outs[present_value_index]
+                        if eagle_cache_max_len:
+                            past_key = past_key[:, :, -eagle_cache_max_len:, :]
+                            past_value = past_value[:, :, -eagle_cache_max_len:, :]
+                        current_token = next_token
+                        current_feature = next_feature
+                        cache.append(next_token, next_feature, dtype=eagle_np_dtype)
+                        remaining_steps -= 1
+
+            if remaining_steps > 0 and use_device_loop:
                 step_tokens = normalize_token_ids(current_token)
                 step_features = normalize_hidden_states(current_feature, dtype=eagle_np_dtype)
-                eagle_inputs = {
-                    eagle_input_ids: step_tokens,
-                    eagle_hidden_input: step_features,
-                    eagle_past_key: empty_past,
-                    eagle_past_value: empty_past,
-                }
-                eagle_outs = eagle_session.run(None, eagle_inputs)
-                logits = eagle_outs[eagle_logits_index]
-                next_hidden = eagle_outs[eagle_hidden_index]
-                next_token = np.argmax(logits[:, -1:, :], axis=-1).astype(np.int64)
-                next_feature = next_hidden[:, -1:, :]
-                draft_tokens = [next_token.item()]
-                past_key = eagle_outs[present_key_index]
-                past_value = eagle_outs[present_value_index]
-                if eagle_cache_max_len:
-                    past_key = past_key[:, :, -eagle_cache_max_len:, :]
-                    past_value = past_value[:, :, -eagle_cache_max_len:, :]
-                current_token = next_token
-                current_feature = next_feature
-                cache.append(next_token, next_feature, dtype=eagle_np_dtype)
-                remaining_steps -= 1
-
-        if remaining_steps > 0 and use_device_loop:
-            step_tokens = normalize_token_ids(current_token)
-            step_features = normalize_hidden_states(current_feature, dtype=eagle_np_dtype)
-            loop_inputs = {EAGLE_INPUT_IDS: step_tokens, EAGLE_INPUT_HIDDEN: step_features}
-            if use_cache:
-                loop_inputs[EAGLE_INPUT_PAST_KEY] = past_key
-                loop_inputs[EAGLE_INPUT_PAST_VALUE] = past_value
-            loop_outs = eagle_loop_session.run(normalize_qaic_inputs(eagle_loop_session, loop_inputs))
-            loop_tokens = loop_outs[loop_token_output]
-            loop_hidden = loop_outs[loop_hidden_output]
-            if loop_tokens.ndim == 1:
-                loop_tokens = loop_tokens.reshape(1, -1)
-            draft_tokens.extend(loop_tokens[0].tolist())
-            current_token = loop_tokens[:, -1:].astype(np.int64)
-            current_feature = loop_hidden[:, -1:, :]
-            if use_cache and loop_present_key and loop_present_value:
-                past_key = loop_outs[loop_present_key]
-                past_value = loop_outs[loop_present_value]
-                if eagle_cache_max_len:
-                    past_key = past_key[:, :, -eagle_cache_max_len:, :]
-                    past_value = past_value[:, :, -eagle_cache_max_len:, :]
-        elif remaining_steps > 0:
-            if eagle_session is None:
-                raise RuntimeError("Eagle ONNX session is not available for host-side loop.")
-            step_offset = num_speculative_tokens - remaining_steps
-            for i in range(remaining_steps):
-                step_idx = step_offset + i + 1
-                print(f"  [Draft Step {step_idx}/{num_speculative_tokens}] Eagle Forward...")
+                loop_inputs = {EAGLE_INPUT_IDS: step_tokens, EAGLE_INPUT_HIDDEN: step_features}
                 if use_cache:
-                    step_tokens = normalize_token_ids(current_token)
-                    step_features = normalize_hidden_states(current_feature, dtype=eagle_np_dtype)
-                    eagle_inputs = {
-                        eagle_input_ids: step_tokens,
-                        eagle_hidden_input: step_features,
-                        eagle_past_key: past_key,
-                        eagle_past_value: past_value,
-                    }
-                else:
-                    window_tokens, window_features = cache.window()
-                    window_tokens = normalize_token_ids(window_tokens)
-                    window_features = normalize_hidden_states(window_features, dtype=eagle_np_dtype)
-                    eagle_inputs = {eagle_input_ids: window_tokens, eagle_hidden_input: window_features}
-                eagle_outs = eagle_session.run(normalize_qaic_inputs(eagle_session, eagle_inputs))
-                logits = eagle_outs[eagle_logits_output]
-                next_hidden = eagle_outs[eagle_hidden_output]
-                if use_cache:
-                    past_key = eagle_outs[eagle_present_key]
-                    past_value = eagle_outs[eagle_present_value]
+                    loop_inputs[EAGLE_INPUT_PAST_KEY] = past_key
+                    loop_inputs[EAGLE_INPUT_PAST_VALUE] = past_value
+                loop_outs = eagle_loop_session.run(normalize_qaic_inputs(eagle_loop_session, loop_inputs))
+                loop_tokens = loop_outs[loop_token_output]
+                loop_hidden = loop_outs[loop_hidden_output]
+                if loop_tokens.ndim == 1:
+                    loop_tokens = loop_tokens.reshape(1, -1)
+                draft_tokens.extend(loop_tokens[0].tolist())
+                current_token = loop_tokens[:, -1:].astype(np.int64)
+                current_feature = loop_hidden[:, -1:, :]
+                if use_cache and loop_present_key and loop_present_value:
+                    past_key = loop_outs[loop_present_key]
+                    past_value = loop_outs[loop_present_value]
                     if eagle_cache_max_len:
                         past_key = past_key[:, :, -eagle_cache_max_len:, :]
                         past_value = past_value[:, :, -eagle_cache_max_len:, :]
-                next_token = np.argmax(logits[:, -1:, :], axis=-1).astype(np.int64)
-                next_feature = next_hidden[:, -1:, :]
-                draft_tokens.append(next_token.item())
-                cache.append(next_token, next_feature, dtype=eagle_np_dtype)
-                current_token = next_token
-                current_feature = next_feature
+            elif remaining_steps > 0:
+                if eagle_session is None:
+                    raise RuntimeError("Eagle ONNX session is not available for host-side loop.")
+                step_offset = num_speculative_tokens - remaining_steps
+                for i in range(remaining_steps):
+                    step_idx = step_offset + i + 1
+                    print(f"  [Draft Step {step_idx}/{num_speculative_tokens}] Eagle Forward...")
+                    if use_cache:
+                        step_tokens = normalize_token_ids(current_token)
+                        step_features = normalize_hidden_states(current_feature, dtype=eagle_np_dtype)
+                        eagle_inputs = {
+                            eagle_input_ids: step_tokens,
+                            eagle_hidden_input: step_features,
+                            eagle_past_key: past_key,
+                            eagle_past_value: past_value,
+                        }
+                    else:
+                        window_tokens, window_features = cache.window()
+                        window_tokens = normalize_token_ids(window_tokens)
+                        window_features = normalize_hidden_states(window_features, dtype=eagle_np_dtype)
+                        eagle_inputs = {eagle_input_ids: window_tokens, eagle_hidden_input: window_features}
+                    eagle_outs = eagle_session.run(normalize_qaic_inputs(eagle_session, eagle_inputs))
+                    logits = eagle_outs[eagle_logits_output]
+                    next_hidden = eagle_outs[eagle_hidden_output]
+                    if use_cache:
+                        past_key = eagle_outs[eagle_present_key]
+                        past_value = eagle_outs[eagle_present_value]
+                        if eagle_cache_max_len:
+                            past_key = past_key[:, :, -eagle_cache_max_len:, :]
+                            past_value = past_value[:, :, -eagle_cache_max_len:, :]
+                    next_token = np.argmax(logits[:, -1:, :], axis=-1).astype(np.int64)
+                    next_feature = next_hidden[:, -1:, :]
+                    draft_tokens.append(next_token.item())
+                    cache.append(next_token, next_feature, dtype=eagle_np_dtype)
+                    current_token = next_token
+                    current_feature = next_feature
 
-        print(f" Drafted Tokens: {draft_tokens}")
-        drafted_text = tokenizer.decode(draft_tokens, skip_special_tokens=False)
-        print(f" Drafted Text: {drafted_text!r}")
-        print(" [Verify] Target verification loop not implemented yet.")
+            print(f" Drafted Tokens: {draft_tokens}")
+            drafted_text = tokenizer.decode(draft_tokens, skip_special_tokens=False)
+            print(f" Drafted Text: {drafted_text!r}")
+            if not draft_tokens:
+                break
+            total_draft_tokens += len(draft_tokens)
+            verify_len = num_speculative_tokens + 1
+            verify_inputs = {
+                "input_ids": np.zeros((1, verify_len), dtype=np.int64),
+                "position_ids": np.zeros((1, verify_len), dtype=np.int64),
+                "num_logits_to_keep": np.zeros((verify_len, 1), dtype=np.int64),
+            }
+            verify_inputs["input_ids"][0, 0] = verify_seed_token.item()
+            valid_draft = np.array(draft_tokens, dtype=np.int64)
+            max_draft = verify_len - 1
+            verify_inputs["input_ids"][0, 1 : 1 + len(valid_draft)] = valid_draft[:max_draft]
+            if len(valid_draft) < max_draft:
+                verify_inputs["input_ids"][0, 1 + len(valid_draft) :] = tokenizer.pad_token_id
+            verify_inputs["position_ids"][0] = -1
+            start_pos = position_cursor - 1
+            verify_inputs["position_ids"][0, : 1 + len(valid_draft)] = np.arange(
+                start_pos, start_pos + 1 + len(valid_draft), dtype=np.int64
+            )
+            if "attention_mask" in target_session.input_names:
+                verify_inputs["attention_mask"] = np.zeros((1, verify_len), dtype=np.int64)
+                verify_inputs["attention_mask"][0, : 1 + len(valid_draft)] = 1
+            target_session.set_buffers(
+                {
+                    "logits": np.zeros((1, verify_len, vocab_size), dtype=logits_dtype),
+                    "hidden_states": np.zeros((1, verify_len, model_config.hidden_size), dtype=hidden_dtype),
+                }
+            )
+            verify_outs = target_session.run(verify_inputs)
+            target_logits = verify_outs["logits"]
+            target_tokens = target_logits.argmax(-1)[0]
+            draft_array = np.array(draft_tokens, dtype=np.int64)
+            matches = draft_array == target_tokens[: len(draft_array)]
+            accepted_draft = int(np.cumprod(matches).sum()) if matches.size else 0
+            accepted_count = min(accepted_draft + 1, 1 + len(draft_tokens))
+            remaining_quota = max_tokens - len(generated_ids)
+            accepted_count = min(accepted_count, remaining_quota)
+            verified_tokens = target_tokens[:accepted_count].tolist()
+            verified_hidden = verify_outs["hidden_states"][0, :accepted_count, :]
+            print(f" Verified Tokens: {verified_tokens}")
+            verified_text = tokenizer.decode(verified_tokens, skip_special_tokens=False)
+            print(f" Verified Text: {verified_text!r}")
+            print(f" Accepted draft tokens: {accepted_draft}/{len(draft_tokens)}")
+            accepted_draft_tokens += accepted_draft
+            verified_token_count += len(verified_tokens)
+
+            for idx, token_id in enumerate(verified_tokens):
+                token_arr = np.array([[token_id]], dtype=np.int64)
+                hidden_arr = verified_hidden[idx : idx + 1, :].reshape(1, 1, -1)
+                cache.append(token_arr, hidden_arr, dtype=eagle_np_dtype)
+                current_token = token_arr
+                current_feature = hidden_arr
+            generated_ids.extend(verified_tokens)
+            position_cursor += len(verified_tokens)
+            if accepted_draft < len(draft_tokens) and use_cache:
+                past_key = None
+                past_value = None
+                cache = EagleFeatureCache(max_len=eagle_window)
+                cache.append(current_token, current_feature, dtype=eagle_np_dtype)
+            if len(generated_ids) >= max_tokens:
+                break
+
+        full_output_ids = tokenizer(prompt, return_tensors="np").input_ids[0].tolist() + generated_ids
+        full_text = tokenizer.decode(full_output_ids, skip_special_tokens=False)
+        print(f" Full Text: {full_text!r}")
+        if total_draft_tokens:
+            acceptance_rate = accepted_draft_tokens / total_draft_tokens
+            print(
+                " Summary: "
+                f"verified_tokens={verified_token_count}, "
+                f"draft_tokens={total_draft_tokens}, "
+                f"accepted_draft_tokens={accepted_draft_tokens}, "
+                f"acceptance_rate={acceptance_rate:.2%}"
+            )
+        else:
+            print(f" Summary: verified_tokens={verified_token_count}, draft_tokens=0")
 
     return "Done"
 
@@ -431,6 +517,7 @@ if __name__ == "__main__":
     parser.add_argument("--eagle-device-group", type=str, default=None)
     parser.add_argument("--target-num-cores", type=int, default=14)
     parser.add_argument("--eagle-num-cores", type=int, default=2)
+    parser.add_argument("--max-tokens", type=int, default=64)
     parser.add_argument("--eagle-window", type=int, default=1)
     parser.add_argument("--eagle-dtype", type=str, choices=["fp16", "fp32"], default="fp32")
     parser.add_argument("--eagle-use-cache", action="store_true")
@@ -446,8 +533,10 @@ if __name__ == "__main__":
         prefill_seq_len=args.prefill_seq_len,
         ctx_len=args.ctx_len,
         device_group=parse_device_group(args.device_group),
+        eagle_device_group=parse_device_group(args.eagle_device_group) if args.eagle_device_group else None,
         target_num_cores=args.target_num_cores,
         eagle_num_cores=args.eagle_num_cores,
+        max_tokens=args.max_tokens,
         eagle_window=args.eagle_window,
         eagle_dtype=args.eagle_dtype,
         eagle_use_cache=args.eagle_use_cache,
