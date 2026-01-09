@@ -129,11 +129,14 @@ def compile_kv_model_on_cloud_ai_100(
         raise FileNotFoundError(f"Please use 'QEfficient.compile', as {specializations_json} file was not found")
     if not os.path.isfile(custom_io_path):
         raise FileNotFoundError(f"{custom_io_path} file was not found!")
+    aic_hw_version = kwargs.pop("aic_hw_version", kwargs.pop("aic-hw-version", constants.DEFAULT_AIC_HW_VERSION))
+    if aic_hw_version == "ai100":
+        aic_hw_version = "2.0"
     command = [
         "/opt/qti-aic/exec/qaic-exec",
         f"-m={onnx_path}",
         "-aic-hw",
-        f"-aic-hw-version={kwargs.pop('aic_hw_version', kwargs.pop('aic-hw-version', constants.DEFAULT_AIC_HW_VERSION))}",
+        f"-aic-hw-version={aic_hw_version}",
         f"-network-specialization-config={specializations_json}",
         "-convert-to-fp16",
         "-retained-state",
@@ -172,7 +175,9 @@ def compile_kv_model_on_cloud_ai_100(
             continue
         command.append(f"{option}={value}")
     print("Running AI 100 compiler:", " ".join(command))
-    result = subprocess.run(command, capture_output=True, text=True)
+    work_dir = os.path.join(base_path, "qaic_workdir")
+    os.makedirs(work_dir, exist_ok=True)
+    result = subprocess.run(command, capture_output=True, text=True, cwd=work_dir)
     if result.returncode != 0:
         raise RuntimeError(f"Compilation Failed!!\n\nSTDOUT\n{result.stdout}\n\nSTDERR\n{result.stderr}")
 

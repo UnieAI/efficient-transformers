@@ -438,13 +438,12 @@ class QEFFBaseModel(ABC):
 
             return self.qpc_path
 
-        command = (
-            constants.COMPILER
-            + [
-                f"-aic-hw-version={compiler_options.pop('aic_hw_version', compiler_options.pop('aic-hw-version', constants.DEFAULT_AIC_HW_VERSION))}"
-            ]
-            + [f"-m={onnx_path}"]
+        aic_hw_version = compiler_options.pop(
+            "aic_hw_version", compiler_options.pop("aic-hw-version", constants.DEFAULT_AIC_HW_VERSION)
         )
+        if aic_hw_version == "ai100":
+            aic_hw_version = "2.0"
+        command = constants.COMPILER + [f"-aic-hw-version={aic_hw_version}"] + [f"-m={onnx_path}"]
 
         if mdp_ts_json_path := compiler_options.pop("mdp_load_partition_config", None):
             command.append(f"-mdp-load-partition-config={mdp_ts_json_path}")
@@ -519,8 +518,10 @@ class QEFFBaseModel(ABC):
         command.append(f"-aic-binary-dir={qpc_path}")
         logger.info(f"Running compiler: {' '.join(command)}")
 
+        work_dir = compile_dir / "qaic_workdir"
+        work_dir.mkdir(parents=True, exist_ok=True)
         try:
-            subprocess.run(command, capture_output=True, check=True)
+            subprocess.run(command, capture_output=True, check=True, cwd=work_dir)
         except subprocess.CalledProcessError as e:
             raise RuntimeError(
                 "\n".join(

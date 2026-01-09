@@ -89,3 +89,10 @@ cython_debug/
 cache_dir
 qeff_models
 .vscode/*
+
+models/
+eagle_artifacts/
+eagle_head_qpc/
+eagle_loop_qpc/
+qaic_workdir/
+**/qaic_workdir/

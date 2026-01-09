@@ -5,13 +5,19 @@
 #
 # -----------------------------------------------------------------------------
 
+import json
 import os
+from contextlib import contextmanager
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional, Tuple
 
 import numpy as np
+import onnx
 import torch
+from onnx import TensorProto, numpy_helper
 
+from QEfficient.compile.compile_helper import compile_kv_model_on_cloud_ai_100
 from QEfficient.transformers.spd.eagle import EagleConfig, EagleDraftLoop, EagleHead
 
 EAGLE_INPUT_IDS = "input_ids"
@@ -24,6 +30,65 @@ EAGLE_OUTPUT_LOGITS = "logits"
 EAGLE_OUTPUT_HIDDEN = "hidden_states"
 EAGLE_OUTPUT_PRESENT_KEY = "present_key"
 EAGLE_OUTPUT_PRESENT_VALUE = "present_value"
+
+
+@contextmanager
+def _pushd(path: str):
+    prev = os.getcwd()
+    os.makedirs(path, exist_ok=True)
+    os.chdir(path)
+    try:
+        yield
+    finally:
+        os.chdir(prev)
+
+
+def _rewrite_double_casts(onnx_path: str, target_dtype: int) -> None:
+    model = onnx.load(onnx_path)
+    updated = False
+    for node in model.graph.node:
+        if node.op_type != "Cast":
+            continue
+        for attr in node.attribute:
+            if attr.name == "to" and attr.i == TensorProto.DOUBLE:
+                attr.i = target_dtype
+                updated = True
+    for node in model.graph.node:
+        if node.op_type != "Constant":
+            continue
+        for attr in node.attribute:
+            if attr.name != "value" or attr.t.data_type != TensorProto.DOUBLE:
+                continue
+            array = numpy_helper.to_array(attr.t)
+            if target_dtype == TensorProto.FLOAT16:
+                array = array.astype(np.float16)
+            else:
+                array = array.astype(np.float32)
+            new_tensor = numpy_helper.from_array(array, name=attr.t.name)
+            attr.t.CopyFrom(new_tensor)
+            updated = True
+    if updated:
+        onnx.save(model, onnx_path)
+
+
+def _consolidate_external_data(onnx_path: str) -> None:
+    onnx_path_abs = Path(onnx_path).resolve()
+    model = onnx.load(str(onnx_path_abs))
+    data_path = f"{onnx_path_abs.name}.data"
+    data_file = onnx_path_abs.with_name(data_path)
+    if data_file.exists():
+        data_file.unlink()
+    cwd_data_file = Path.cwd() / data_path
+    if cwd_data_file.exists():
+        cwd_data_file.unlink()
+    onnx.save_model(
+        model,
+        str(onnx_path_abs),
+        save_as_external_data=True,
+        all_tensors_to_one_file=True,
+        location=data_path,
+        size_threshold=1024,
+    )
 
 
 
@@ -46,7 +111,7 @@ def load_eagle_head(vocab_size=32000, hidden_size=2048, num_attention_heads=4, w
 
 def compile_eagle_head(
     model,
-    output_dir=".",
+    output_dir="eagle_artifacts",
     batch_size=1,
     seq_len=1,
     dtype: torch.dtype = torch.float32,
@@ -99,15 +164,19 @@ def compile_eagle_head(
             EAGLE_OUTPUT_HIDDEN: {0: "batch_size", 1: "seq_len"},
         }
 
-    torch.onnx.export(
-        model,
-        export_args,
-        onnx_path,
-        input_names=input_names,
-        output_names=output_names,
-        dynamic_axes=dynamic_axes,
-        opset_version=14,
-    )
+    with _pushd(output_dir):
+        torch.onnx.export(
+            model,
+            export_args,
+            "eagle_head.onnx",
+            input_names=input_names,
+            output_names=output_names,
+            dynamic_axes=dynamic_axes,
+            opset_version=14,
+        )
+    _consolidate_external_data(onnx_path)
+    target_dtype = TensorProto.FLOAT16 if dtype == torch.float16 else TensorProto.FLOAT
+    _rewrite_double_casts(onnx_path, target_dtype)
     print("Export complete.")
     return onnx_path
 
@@ -116,7 +185,7 @@ def compile_eagle_head(
 def compile_eagle_loop(
     model,
     num_steps: int,
-    output_dir=".",
+    output_dir="eagle_artifacts",
     batch_size=1,
     dtype: torch.dtype = torch.float32,
     use_cache: bool = False,
@@ -168,16 +237,83 @@ def compile_eagle_loop(
             EAGLE_LOOP_OUTPUT_HIDDEN: {0: "batch_size"},
         }
 
-    torch.onnx.export(
-        loop_model,
-        export_args,
-        onnx_path,
-        input_names=input_names,
-        output_names=output_names,
-        dynamic_axes=dynamic_axes,
-        opset_version=14,
-    )
+    with _pushd(output_dir):
+        torch.onnx.export(
+            loop_model,
+            export_args,
+            f"eagle_loop_{num_steps}.onnx",
+            input_names=input_names,
+            output_names=output_names,
+            dynamic_axes=dynamic_axes,
+            opset_version=14,
+        )
+    _consolidate_external_data(onnx_path)
+    target_dtype = TensorProto.FLOAT16 if dtype == torch.float16 else TensorProto.FLOAT
+    _rewrite_double_casts(onnx_path, target_dtype)
     return onnx_path
+
+def compile_eagle_qpc(
+    onnx_path: str,
+    output_dir: str,
+    *,
+    batch_size: int = 1,
+    seq_len: int = 1,
+    past_len: int = 1,
+    total_len: int = 1,
+    num_cores: int = 2,
+    mxfp6: bool = True,
+    aic_enable_depth_first: bool = True,
+    allow_mxint8_mdp_io: bool = False,
+    device_group: Optional[list] = None,
+    custom_io: Optional[dict] = None,
+):
+    """
+    Compile Eagle ONNX to QAIC QPC.
+    """
+    output_path = Path(output_dir).resolve()
+    output_path.mkdir(parents=True, exist_ok=True)
+    qaic_exec = Path("/opt/qti-aic/exec/qaic-exec")
+    if not qaic_exec.exists():
+        raise FileNotFoundError("qaic-exec not found at /opt/qti-aic/exec/qaic-exec.")
+    onnx_path_abs = str(Path(onnx_path).resolve())
+    specializations_json = output_path / "specializations.json"
+    specialization = {"batch_size": str(batch_size)}
+    if seq_len is not None:
+        specialization["seq_len"] = str(seq_len)
+    if past_len is not None:
+        specialization["past_len"] = str(past_len)
+    if total_len is not None:
+        specialization["total_len"] = str(total_len)
+    specializations = {"specializations": [specialization]}
+    with open(specializations_json, "w") as fp:
+        json.dump(specializations, fp, indent=4)
+
+    if custom_io is None:
+        custom_io = {
+            EAGLE_INPUT_HIDDEN: "float16",
+            EAGLE_INPUT_PAST_KEY: "float16",
+            EAGLE_INPUT_PAST_VALUE: "float16",
+            EAGLE_LOOP_OUTPUT_HIDDEN: "float16",
+            EAGLE_OUTPUT_PRESENT_KEY: "float16",
+            EAGLE_OUTPUT_PRESENT_VALUE: "float16",
+        }
+    custom_io_yaml = output_path / "custom_io.yaml"
+    with open(custom_io_yaml, "w") as fp:
+        for io_name, dtype in custom_io.items():
+            fp.write(f" - IOName: {io_name}\n   Precision: {dtype}\n\n")
+
+    _, qpc_path = compile_kv_model_on_cloud_ai_100(
+        onnx_path=onnx_path_abs,
+        specializations_json=str(specializations_json.resolve()),
+        num_cores=num_cores,
+        base_path=str(output_path),
+        mxfp6=mxfp6,
+        custom_io_path=str(custom_io_yaml.resolve()),
+        aic_enable_depth_first=aic_enable_depth_first,
+        allow_mxint8_mdp_io=allow_mxint8_mdp_io,
+        device_group=device_group,
+    )
+    return qpc_path
 
 
 def normalize_token_ids(token_ids: np.ndarray) -> np.ndarray:
