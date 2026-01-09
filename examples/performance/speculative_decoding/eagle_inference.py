@@ -130,8 +130,8 @@ def eagle_spec_decode_inference(
     prefill_seq_len=128,
     ctx_len=512,
     device_group=None,
-    target_device_group=None,
-    eagle_device_group=None,
+    target_num_cores=14,
+    eagle_num_cores=2,
     eagle_window=1,
     eagle_dtype="fp32",
     eagle_use_cache=False,
@@ -139,8 +139,8 @@ def eagle_spec_decode_inference(
     eagle_on_device_loop=False,
 ):
     device_group = device_group or [0]
-    target_device_group = target_device_group or device_group
-    eagle_device_group = eagle_device_group or device_group
+    target_device_group = device_group
+    eagle_device_group = device_group
     print(f"Loading Target Model: {target_model_name}")
     tokenizer = AutoTokenizer.from_pretrained(target_model_name)
     if tokenizer.pad_token_id is None:
@@ -150,12 +150,15 @@ def eagle_spec_decode_inference(
     target_model = AutoModelForCausalLM.from_pretrained(target_model_name, qaic_config=qaic_config)
 
     print("Compiling Target Model...")
+    if eagle_device_group == target_device_group:
+        print(f"Target compiled with fixed cores for Eagle co-location: num_cores={target_num_cores}")
     target_qpc = target_model.compile(
         num_devices=len(target_device_group),
         prefill_seq_len=prefill_seq_len,
         ctx_len=ctx_len,
         num_speculative_tokens=num_speculative_tokens,
         aic_enable_depth_first=True,
+        num_cores=target_num_cores,
     )
     target_session = QAICInferenceSession(target_qpc, device_ids=target_device_group)
     target_session.skip_buffers(set([x for x in target_session.input_names if x.startswith("past_")]))
@@ -176,6 +179,7 @@ def eagle_spec_decode_inference(
         num_attention_heads=num_attention_heads,
         weights_path=eagle_weights_path,
     )
+    print(f"Eagle head initialized with weights: {eagle_weights_path}")
     eagle_torch_dtype = torch.float16 if eagle_dtype == "fp16" else torch.float32
     eagle_np_dtype = np.float16 if eagle_dtype == "fp16" else np.float32
     use_cache = bool(eagle_use_cache)
@@ -187,8 +191,13 @@ def eagle_spec_decode_inference(
     use_device_loop = eagle_on_device_loop and use_cache and loop_steps > 0
     eagle_head_compile_dir = "eagle_head_qpc"
     eagle_loop_compile_dir = "eagle_loop_qpc"
-    eagle_head_num_cores = 2
-    eagle_loop_num_cores = 2
+    eagle_head_num_cores = eagle_num_cores
+    eagle_loop_num_cores = eagle_num_cores
+    if eagle_device_group == target_device_group:
+        print(
+            "Eagle shares device group with target; using fixed cores "
+            f"(eagle_head_num_cores={eagle_head_num_cores}, eagle_loop_num_cores={eagle_loop_num_cores})."
+        )
 
     eagle_session = None
     eagle_loop_session = None
@@ -212,6 +221,7 @@ def eagle_spec_decode_inference(
             device_group=eagle_device_group,
         )
         eagle_loop_session = QAICInferenceSession(eagle_loop_qpc_path, device_ids=eagle_device_group)
+        print(f"Eagle loop session ready: qpc={eagle_loop_qpc_path}, device_group={eagle_device_group}")
         loop_token_output, loop_hidden_output, loop_present_key, loop_present_value = resolve_eagle_loop_names(
             eagle_loop_session
         )
@@ -258,6 +268,7 @@ def eagle_spec_decode_inference(
             custom_io=eagle_custom_io,
         )
         eagle_session = QAICInferenceSession(eagle_qpc_path, device_ids=eagle_device_group)
+        print(f"Eagle head session ready: qpc={eagle_qpc_path}, device_group={eagle_device_group}")
         (
             eagle_input_ids,
             eagle_hidden_input,
@@ -401,6 +412,8 @@ def eagle_spec_decode_inference(
                 current_feature = next_feature
 
         print(f" Drafted Tokens: {draft_tokens}")
+        drafted_text = tokenizer.decode(draft_tokens, skip_special_tokens=False)
+        print(f" Drafted Text: {drafted_text!r}")
         print(" [Verify] Target verification loop not implemented yet.")
 
     return "Done"
@@ -415,8 +428,9 @@ if __name__ == "__main__":
     parser.add_argument("--prefill-seq-len", type=int, default=128)
     parser.add_argument("--ctx-len", type=int, default=512)
     parser.add_argument("--device-group", type=str, default="0")
-    parser.add_argument("--target-device-group", type=str, default=None)
     parser.add_argument("--eagle-device-group", type=str, default=None)
+    parser.add_argument("--target-num-cores", type=int, default=14)
+    parser.add_argument("--eagle-num-cores", type=int, default=2)
     parser.add_argument("--eagle-window", type=int, default=1)
     parser.add_argument("--eagle-dtype", type=str, choices=["fp16", "fp32"], default="fp32")
     parser.add_argument("--eagle-use-cache", action="store_true")
@@ -432,10 +446,8 @@ if __name__ == "__main__":
         prefill_seq_len=args.prefill_seq_len,
         ctx_len=args.ctx_len,
         device_group=parse_device_group(args.device_group),
-        target_device_group=parse_device_group(args.target_device_group)
-        if args.target_device_group
-        else None,
-        eagle_device_group=parse_device_group(args.eagle_device_group) if args.eagle_device_group else None,
+        target_num_cores=args.target_num_cores,
+        eagle_num_cores=args.eagle_num_cores,
         eagle_window=args.eagle_window,
         eagle_dtype=args.eagle_dtype,
         eagle_use_cache=args.eagle_use_cache,
