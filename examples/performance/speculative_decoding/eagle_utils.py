@@ -19,6 +19,7 @@ from onnx import TensorProto, numpy_helper
 
 from QEfficient.compile.compile_helper import compile_kv_model_on_cloud_ai_100
 from QEfficient.transformers.spd.eagle import EagleConfig, EagleDraftLoop, EagleHead
+from QEfficient.utils.checkpoint_utils import load_checkpoint
 
 EAGLE_INPUT_IDS = "input_ids"
 EAGLE_INPUT_HIDDEN = "history_hidden_states"
@@ -99,9 +100,27 @@ def load_eagle_head(vocab_size=32000, hidden_size=2048, num_attention_heads=4, w
     config = EagleConfig(vocab_size, hidden_size, num_attention_heads)
     model = EagleHead(config, hidden_size)
     
-    if weights_path and os.path.exists(weights_path):
-        print(f"Loading Eagle weights from {weights_path}")
-        model.load_state_dict(torch.load(weights_path, map_location="cpu"))
+    if weights_path:
+        resolved_path = Path(weights_path)
+        if not resolved_path.exists():
+            fallback_path = Path("models") / weights_path
+            if fallback_path.exists():
+                resolved_path = fallback_path
+        if resolved_path.exists():
+            if resolved_path.is_dir():
+                safetensors_path = resolved_path / "model.safetensors"
+                if not safetensors_path.exists():
+                    raise FileNotFoundError(f"Eagle weights not found at {safetensors_path}")
+                print(f"Loading Eagle weights from {safetensors_path}")
+                load_checkpoint(model, str(safetensors_path), strict=False)
+            elif resolved_path.suffix == ".safetensors":
+                print(f"Loading Eagle weights from {resolved_path}")
+                load_checkpoint(model, str(resolved_path), strict=False)
+            else:
+                print(f"Loading Eagle weights from {resolved_path}")
+                model.load_state_dict(torch.load(str(resolved_path), map_location="cpu"), strict=False)
+        else:
+            print(f"Eagle weights not found at {weights_path}; initializing random weights (Dummy Mode)")
     else:
         print("Initializing Eagle Head with random weights (Dummy Mode)")
         
