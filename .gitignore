@@ -91,6 +91,7 @@ qeff_models
 .vscode/*
 
 models/JKroller
+models/wking669
 eagle_artifacts/
 eagle_head_qpc/
 eagle_loop_qpc/
