@@ -92,6 +92,39 @@ def _consolidate_external_data(onnx_path: str) -> None:
     )
 
 
+def _adapt_state_dict_for_vocab(state_dict: dict, model: torch.nn.Module) -> dict:
+    model_state = model.state_dict()
+    adjusted = {}
+    resized = []
+    skipped = []
+    for key, tensor in state_dict.items():
+        if key not in model_state:
+            skipped.append(key)
+            continue
+        model_tensor = model_state[key]
+        if tensor.shape == model_tensor.shape:
+            adjusted[key] = tensor
+            continue
+        if (
+            tensor.dim() == 2
+            and model_tensor.dim() == 2
+            and tensor.shape[1] == model_tensor.shape[1]
+        ):
+            new_tensor = model_tensor.clone()
+            size = min(tensor.shape[0], model_tensor.shape[0])
+            new_tensor[:size, :] = tensor[:size, :]
+            adjusted[key] = new_tensor
+            resized.append((key, tensor.shape, model_tensor.shape))
+        else:
+            skipped.append(key)
+    if resized:
+        resized_str = ", ".join(f"{key} {src}->{dst}" for key, src, dst in resized)
+        print(f"Resized Eagle weights for vocab mismatch: {resized_str}")
+    if skipped:
+        print(f"Skipped {len(skipped)} non-matching Eagle weights.")
+    return adjusted
+
+
 
 def load_eagle_head(vocab_size=32000, hidden_size=2048, num_attention_heads=4, weights_path=None):
     """
@@ -109,16 +142,49 @@ def load_eagle_head(vocab_size=32000, hidden_size=2048, num_attention_heads=4, w
         if resolved_path.exists():
             if resolved_path.is_dir():
                 safetensors_path = resolved_path / "model.safetensors"
-                if not safetensors_path.exists():
-                    raise FileNotFoundError(f"Eagle weights not found at {safetensors_path}")
-                print(f"Loading Eagle weights from {safetensors_path}")
-                load_checkpoint(model, str(safetensors_path), strict=False)
+                pytorch_path = resolved_path / "pytorch_model.bin"
+                if safetensors_path.exists():
+                    print(f"Loading Eagle weights from {safetensors_path}")
+                    load_checkpoint(
+                        model,
+                        str(safetensors_path),
+                        strict=False,
+                        post_process_func=lambda sd: _adapt_state_dict_for_vocab(sd, model),
+                    )
+                elif pytorch_path.exists():
+                    print(f"Loading Eagle weights from {pytorch_path}")
+                    state_dict = torch.load(str(pytorch_path), map_location="cpu")
+                    if isinstance(state_dict, dict) and "state_dict" in state_dict:
+                        state_dict = state_dict["state_dict"]
+                    state_dict = _adapt_state_dict_for_vocab(state_dict, model)
+                    model.load_state_dict(state_dict, strict=False)
+                else:
+                    raise FileNotFoundError(
+                        "Eagle weights not found at "
+                        f"{safetensors_path} or {pytorch_path}"
+                    )
             elif resolved_path.suffix == ".safetensors":
                 print(f"Loading Eagle weights from {resolved_path}")
-                load_checkpoint(model, str(resolved_path), strict=False)
+                load_checkpoint(
+                    model,
+                    str(resolved_path),
+                    strict=False,
+                    post_process_func=lambda sd: _adapt_state_dict_for_vocab(sd, model),
+                )
+            elif resolved_path.suffix == ".bin":
+                print(f"Loading Eagle weights from {resolved_path}")
+                state_dict = torch.load(str(resolved_path), map_location="cpu")
+                if isinstance(state_dict, dict) and "state_dict" in state_dict:
+                    state_dict = state_dict["state_dict"]
+                state_dict = _adapt_state_dict_for_vocab(state_dict, model)
+                model.load_state_dict(state_dict, strict=False)
             else:
                 print(f"Loading Eagle weights from {resolved_path}")
-                model.load_state_dict(torch.load(str(resolved_path), map_location="cpu"), strict=False)
+                state_dict = torch.load(str(resolved_path), map_location="cpu")
+                if isinstance(state_dict, dict) and "state_dict" in state_dict:
+                    state_dict = state_dict["state_dict"]
+                state_dict = _adapt_state_dict_for_vocab(state_dict, model)
+                model.load_state_dict(state_dict, strict=False)
         else:
             print(f"Eagle weights not found at {weights_path}; initializing random weights (Dummy Mode)")
     else:

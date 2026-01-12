@@ -5,8 +5,10 @@
 #
 # -----------------------------------------------------------------------------
 
+import os
 import platform
 import sys
+import time
 from pathlib import Path
 from typing import Dict, List, Optional, Union
 from warnings import warn
@@ -76,20 +78,30 @@ class QAICInferenceSession:
             aicapi.INT8_TYPE: np.dtype(np.int8),
         }
 
+        debug_logs = enable_debug_logs or os.getenv("QEFF_QAIC_DEBUG") == "1"
+        def _debug(msg: str) -> None:
+            if debug_logs:
+                print(msg)
+        self._debug = _debug
+
         # Load QPC
         if device_ids is not None:
+            _debug(f"QAIC: creating context for devices {device_ids}")
             devices = qaicrt.QIDList(device_ids)
             self.context = qaicrt.Context(devices)
             self.queue = qaicrt.Queue(self.context, device_ids[0])
         else:
+            _debug("QAIC: creating context for default device 0")
             self.context = qaicrt.Context()
             self.queue = qaicrt.Queue(self.context, 0)  # Async API
         if enable_debug_logs:
             if self.context.setLogLevel(qaicrt.QLogLevel.QL_DEBUG) != qaicrt.QStatus.QS_SUCCESS:
                 raise RuntimeError("Failed to setLogLevel")
+        _debug(f"QAIC: loading QPC from {qpc_path}")
         qpc = qaicrt.Qpc(str(qpc_path))
         # Load IO Descriptor
         iodesc = aicapi.IoDesc()
+        _debug("QAIC: fetching IO descriptor")
         status, iodesc_data = qpc.getIoDescriptor()
         if status != qaicrt.QStatus.QS_SUCCESS:
             raise RuntimeError("Failed to getIoDescriptor")
@@ -105,14 +117,18 @@ class QAICInferenceSession:
         prog_properties.SubmitRetryTimeoutMs = 60_000
         if device_ids and len(device_ids) > 1:
             prog_properties.devMapping = ":".join(map(str, device_ids))
+        _debug("QAIC: creating program")
         self.program = qaicrt.Program(self.context, None, qpc, prog_properties)
+        _debug("QAIC: loading program")
         if self.program.load() != qaicrt.QStatus.QS_SUCCESS:
             raise RuntimeError("Failed to load program")
         self.is_active = False
         if activate:
+            _debug("QAIC: activating program")
             self.activate()
             self.is_active = True
         # Create input qbuffers and buf_dims
+        _debug("QAIC: allocating buffers")
         self.qbuffers = [qaicrt.QBuffer(bytes(binding.size)) for binding in self.bindings]
         self.buf_dims = qaicrt.BufferDimensionsVecRef(
             [(self.aic_to_np_dtype_mapping[binding.type].itemsize, list(binding.dims)) for binding in self.bindings]
@@ -129,9 +145,24 @@ class QAICInferenceSession:
     def activate(self):
         """Activate qpc"""
         if not self.is_active:
-            self.program.activate()
-            self.execObj = qaicrt.ExecObj(self.context, self.program)
-            self.is_active = True
+            retries = int(os.getenv("QEFF_QAIC_ACTIVATE_RETRIES", "3"))
+            sleep_s = float(os.getenv("QEFF_QAIC_ACTIVATE_SLEEP", "2"))
+            last_err = None
+            for attempt in range(1, retries + 1):
+                try:
+                    self.program.activate()
+                    self.execObj = qaicrt.ExecObj(self.context, self.program)
+                    self.is_active = True
+                    return
+                except Exception as exc:
+                    last_err = exc
+                    if attempt < retries:
+                        self._debug(
+                            f"QAIC: activation failed ({attempt}/{retries}), retrying in {sleep_s}s: {exc}"
+                        )
+                        time.sleep(sleep_s)
+                    else:
+                        raise last_err
 
     def deactivate(self):
         """Deactivate qpc"""

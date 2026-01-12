@@ -139,6 +139,7 @@ def eagle_spec_decode_inference(
     eagle_use_cache=False,
     eagle_cache_max_len=None,
     eagle_on_device_loop=False,
+    qaic_debug=False,
 ):
     device_group = device_group or [0]
     target_device_group = device_group
@@ -151,20 +152,57 @@ def eagle_spec_decode_inference(
     qaic_config = {"speculative_model_type": "target", "return_hidden_states": True}
     target_model = AutoModelForCausalLM.from_pretrained(target_model_name, qaic_config=qaic_config)
 
-    print("Compiling Target Model...")
-    if eagle_device_group == target_device_group:
-        print(f"Target compiled with fixed cores for Eagle co-location: num_cores={target_num_cores}")
-    target_qpc = target_model.compile(
-        num_devices=len(target_device_group),
-        prefill_seq_len=prefill_seq_len,
-        ctx_len=ctx_len,
-        num_speculative_tokens=num_speculative_tokens,
-        aic_enable_depth_first=True,
-        num_cores=target_num_cores,
-    )
-    target_session = QAICInferenceSession(target_qpc, device_ids=target_device_group)
+    core_candidates = [target_num_cores, 8, 6, 4, 2, 1]
+    core_candidates = [c for i, c in enumerate(core_candidates) if c > 0 and c <= target_num_cores]
+    core_candidates = [c for i, c in enumerate(core_candidates) if c not in core_candidates[:i]]
+
+    target_session = None
+    target_qpc = None
+    selected_target_cores = None
+    for num_cores in core_candidates:
+        print("Compiling Target Model...")
+        if eagle_device_group == target_device_group:
+            print(f"Target compiled with fixed cores for Eagle co-location: num_cores={num_cores}")
+        target_qpc = target_model.compile(
+            num_devices=len(target_device_group),
+            prefill_seq_len=prefill_seq_len,
+            ctx_len=ctx_len,
+            num_speculative_tokens=num_speculative_tokens,
+            aic_enable_depth_first=True,
+            num_cores=num_cores,
+        )
+        print("Creating target session...")
+        try:
+            target_session = QAICInferenceSession(
+                target_qpc,
+                device_ids=target_device_group,
+                enable_debug_logs=qaic_debug,
+            )
+            selected_target_cores = num_cores
+            break
+        except RuntimeError as exc:
+            msg = str(exc)
+            retryable = any(
+                token in msg
+                for token in (
+                    "Couldn't find a suitable device",
+                    "Not enough NSPs",
+                    "Failed to allocate NSP resources",
+                    "Failed to Load program",
+                )
+            )
+            print(f"Target session failed with num_cores={num_cores}: {exc}")
+            if not retryable or num_cores == core_candidates[-1]:
+                raise
+            print("Retrying with fewer target cores...")
+            continue
+
+    if target_session is None or target_qpc is None or selected_target_cores is None:
+        raise RuntimeError("Unable to create target session with available core configurations.")
+    print("Configuring target session buffers...")
     target_session.skip_buffers(set([x for x in target_session.input_names if x.startswith("past_")]))
     target_session.skip_buffers(set([x for x in target_session.output_names if x.endswith("_RetainedState")]))
+    print("Target session ready.")
 
     if "hidden_states" not in target_session.output_names:
         raise ValueError(
@@ -222,7 +260,11 @@ def eagle_spec_decode_inference(
             num_cores=eagle_loop_num_cores,
             device_group=eagle_device_group,
         )
-        eagle_loop_session = QAICInferenceSession(eagle_loop_qpc_path, device_ids=eagle_device_group)
+        eagle_loop_session = QAICInferenceSession(
+            eagle_loop_qpc_path,
+            device_ids=eagle_device_group,
+            enable_debug_logs=qaic_debug,
+        )
         print(f"Eagle loop session ready: qpc={eagle_loop_qpc_path}, device_group={eagle_device_group}")
         loop_token_output, loop_hidden_output, loop_present_key, loop_present_value = resolve_eagle_loop_names(
             eagle_loop_session
@@ -269,7 +311,11 @@ def eagle_spec_decode_inference(
             device_group=eagle_device_group,
             custom_io=eagle_custom_io,
         )
-        eagle_session = QAICInferenceSession(eagle_qpc_path, device_ids=eagle_device_group)
+        eagle_session = QAICInferenceSession(
+            eagle_qpc_path,
+            device_ids=eagle_device_group,
+            enable_debug_logs=qaic_debug,
+        )
         print(f"Eagle head session ready: qpc={eagle_qpc_path}, device_group={eagle_device_group}")
         (
             eagle_input_ids,
@@ -523,6 +569,7 @@ if __name__ == "__main__":
     parser.add_argument("--eagle-use-cache", action="store_true")
     parser.add_argument("--eagle-cache-max-len", type=int, default=None)
     parser.add_argument("--eagle-on-device-loop", action="store_true")
+    parser.add_argument("--qaic-debug", action="store_true")
     args = parser.parse_args()
 
     eagle_spec_decode_inference(
@@ -542,4 +589,5 @@ if __name__ == "__main__":
         eagle_use_cache=args.eagle_use_cache,
         eagle_cache_max_len=args.eagle_cache_max_len,
         eagle_on_device_loop=args.eagle_on_device_loop,
+        qaic_debug=args.qaic_debug,
     )
