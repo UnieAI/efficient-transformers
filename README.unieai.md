@@ -15,7 +15,6 @@
   - `eagle_cache_max_len` 截斷 cache
   - Draft/Target 同卡（`--device-group`）與 cores split（`--target-num-cores`/`--eagle-num-cores`）
   - Verify loop（Target 驗證 Draft tokens，計算接受數量）
-  - N-gram Prompt Lookup（`--draft-method ngram` + `--max-ngram-size`）
   - QAIC compiler 產物集中在 `qaic_workdir/`（避免 `shared_kernels*` 掉到根目錄）
 
 ## How to Run (QAIC Draft + Verify)
@@ -34,9 +33,8 @@ python examples/performance/speculative_decoding/eagle_inference.py \
 
 ## How to Run (QAIC N-gram Draft)
 ```bash
-python examples/performance/speculative_decoding/eagle_inference.py \
+python examples/performance/speculative_decoding/ngram_inference.py \
   --target-model-name "meta-llama/Llama-3.2-1B" \
-  --draft-method ngram \
   --max-ngram-size 3 \
   --num-speculative-tokens 4 \
   --device-group "2" \
