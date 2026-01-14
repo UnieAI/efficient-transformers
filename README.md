@@ -129,3 +129,29 @@ If you run into any problems with the code, please file Github issues directly t
 
 ## Contributing
 This project welcomes contributions and suggestions. Please check the License. Integration with a CLA Bot is underway. 
+
+## Usage
+```
+# just start a server
+python examples/performance/speculative_decoding/ngram_api.py \
+  --target-model-name "Qwen/Qwen2.5-7B-Instruct" \
+  --device-group "0" \
+  --target-num-cores 14 \
+  --max-tokens 1280 \
+  --host 0.0.0.0 \
+  --port 8000
+```
+
+```
+# start server with lookahead speed-up
+python examples/performance/speculative_decoding/ngram_api.py \
+  --target-model-name "Qwen/Qwen2.5-7B-Instruct" \
+  --num-speculative-tokens 4 \
+  --enable-lookahead \
+  --device-group "0" \
+  --target-num-cores 14 \
+  --max-tokens 1280 \
+  --host 0.0.0.0 \
+  --port 8000
+
+```
