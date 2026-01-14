@@ -36,6 +36,7 @@ python examples/performance/speculative_decoding/eagle_inference.py \
 python examples/performance/speculative_decoding/ngram_inference.py \
   --target-model-name "meta-llama/Llama-3.2-1B" \
   --max-ngram-size 3 \
+  --lookahead-tokens 8 \
   --num-speculative-tokens 4 \
   --device-group "2" \
   --target-num-cores 14 \

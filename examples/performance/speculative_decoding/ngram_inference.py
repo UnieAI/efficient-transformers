@@ -100,13 +100,17 @@ def ngram_spec_decode_inference(
     target_num_cores=14,
     max_tokens=64,
     max_ngram_size=3,
+    lookahead_tokens=0,
     qaic_debug=False,
 ):
+    if lookahead_tokens and lookahead_tokens < num_speculative_tokens:
+        raise ValueError("lookahead_tokens must be >= num_speculative_tokens when enabled.")
     device_group = device_group or [0]
     print(f"Loading Target Model: {target_model_name}")
     tokenizer = AutoTokenizer.from_pretrained(target_model_name)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
+    eos_token_id = tokenizer.eos_token_id
 
     qaic_config = {"speculative_model_type": "target"}
     target_model = AutoModelForCausalLM.from_pretrained(target_model_name, qaic_config=qaic_config)
@@ -175,6 +179,9 @@ def ngram_spec_decode_inference(
     )
     target_session.set_buffers(prefill_buffers)
 
+    enable_lookahead = lookahead_tokens > 0
+    lookahead_len = max(num_speculative_tokens, lookahead_tokens) if enable_lookahead else num_speculative_tokens
+
     for prompt in prompts:
         print(f"\nPrompt: {prompt}")
         input_len = tokenizer(prompt, return_tensors="np", padding=True).input_ids.shape[1]
@@ -207,23 +214,28 @@ def ngram_spec_decode_inference(
         )
         target_session.set_buffers(verify_buffers)
 
+        lookahead_buffer: List[int] = []
+        next_report_at = 50
         while len(generated_ids) < max_tokens:
             verify_seed_token = current_token.copy()
             context_len = len(context_ids)
             effective_ngram = min(max_ngram_size, max(1, context_len))
-            spec_tokens, has_empty_tokens = find_candidate_pred_tokens(
-                np.array([context_ids], dtype=np.int64),
-                fill_tok=-1,
-                max_ngram_size=effective_ngram,
-                num_pred_tokens=num_speculative_tokens,
-            )
-            draft_tokens = [] if has_empty_tokens else spec_tokens.tolist()
-            print(f" Drafted Tokens: {draft_tokens}")
-            if draft_tokens:
-                drafted_text = tokenizer.decode(draft_tokens, skip_special_tokens=False)
-                print(f" Drafted Text: {drafted_text!r}")
+            if enable_lookahead and len(lookahead_buffer) >= num_speculative_tokens:
+                draft_tokens = lookahead_buffer[:num_speculative_tokens]
             else:
-                print(" Drafted Text: ''")
+                spec_tokens, has_empty_tokens = find_candidate_pred_tokens(
+                    np.array([context_ids], dtype=np.int64),
+                    fill_tok=-1,
+                    max_ngram_size=effective_ngram,
+                    num_pred_tokens=lookahead_len if enable_lookahead else num_speculative_tokens,
+                )
+                if has_empty_tokens:
+                    lookahead_buffer = []
+                    draft_tokens = []
+                else:
+                    spec_list = spec_tokens.tolist()
+                    lookahead_buffer = spec_list if enable_lookahead else []
+                    draft_tokens = spec_list[:num_speculative_tokens] if enable_lookahead else spec_list
             total_draft_tokens += len(draft_tokens)
             verify_inputs = {
                 "input_ids": np.zeros((1, verify_len), dtype=np.int64),
@@ -250,14 +262,20 @@ def ngram_spec_decode_inference(
             draft_array = np.array(draft_tokens, dtype=np.int64)
             matches = draft_array == target_tokens[: len(draft_array)]
             accepted_draft = int(np.cumprod(matches).sum()) if matches.size else 0
-            accepted_count = min(accepted_draft + 1, 1 + len(draft_tokens))
+            full_match = bool(draft_tokens) and accepted_draft == len(draft_tokens)
+            # Lookahead decoding: skip the bonus token on full match to keep the draft buffer aligned.
+            if enable_lookahead and full_match:
+                accepted_count = len(draft_tokens)
+            else:
+                accepted_count = min(accepted_draft + 1, 1 + len(draft_tokens))
             remaining_quota = max_tokens - len(generated_ids)
             accepted_count = min(accepted_count, remaining_quota)
             verified_tokens = target_tokens[:accepted_count].tolist()
-            print(f" Verified Tokens: {verified_tokens}")
-            verified_text = tokenizer.decode(verified_tokens, skip_special_tokens=False)
-            print(f" Verified Text: {verified_text!r}")
-            print(f" Accepted draft tokens: {accepted_draft}/{len(draft_tokens)}")
+            stop_on_eos = False
+            if eos_token_id is not None and eos_token_id in verified_tokens:
+                eos_index = verified_tokens.index(eos_token_id) + 1
+                verified_tokens = verified_tokens[:eos_index]
+                stop_on_eos = True
             accepted_draft_tokens += accepted_draft
             verified_token_count += len(verified_tokens)
 
@@ -267,12 +285,38 @@ def ngram_spec_decode_inference(
             context_ids.extend(verified_tokens)
             position_cursor += len(verified_tokens)
             current_token = np.array([[verified_tokens[-1]]], dtype=np.int64)
+            while len(generated_ids) >= next_report_at:
+                if total_draft_tokens:
+                    acceptance_rate = accepted_draft_tokens / total_draft_tokens
+                    print(
+                        f" Progress: generated={len(generated_ids)}, "
+                        f"draft_tokens={total_draft_tokens}, "
+                        f"accepted_draft_tokens={accepted_draft_tokens}, "
+                        f"acceptance_rate={acceptance_rate:.2%}"
+                    )
+                else:
+                    print(
+                        f" Progress: generated={len(generated_ids)}, "
+                        "draft_tokens=0, accepted_draft_tokens=0, acceptance_rate=0.00%"
+                    )
+                next_report_at += 50
+            if enable_lookahead:
+                if full_match:
+                    lookahead_buffer = lookahead_buffer[accepted_count:]
+                else:
+                    lookahead_buffer = []
+            if stop_on_eos:
+                break
             if len(generated_ids) >= max_tokens:
                 break
 
         full_output_ids = tokenizer(prompt, return_tensors="np").input_ids[0].tolist() + generated_ids
         full_text = tokenizer.decode(full_output_ids, skip_special_tokens=False)
         print(f" Full Text: {full_text!r}")
+        print(
+            " Total output tokens: "
+            f"{len(full_output_ids)} (prompt={len(prompt_ids)}, generated={len(generated_ids)})"
+        )
         if total_draft_tokens:
             acceptance_rate = accepted_draft_tokens / total_draft_tokens
             print(
@@ -299,6 +343,12 @@ if __name__ == "__main__":
     parser.add_argument("--target-num-cores", type=int, default=14)
     parser.add_argument("--max-tokens", type=int, default=64)
     parser.add_argument("--max-ngram-size", type=int, default=3)
+    parser.add_argument(
+        "--lookahead-tokens",
+        type=int,
+        default=0,
+        help="Enable lookahead decoding by caching n-gram tokens (>= num-speculative-tokens)",
+    )
     parser.add_argument("--qaic-debug", action="store_true")
     args = parser.parse_args()
 
@@ -312,5 +362,6 @@ if __name__ == "__main__":
         target_num_cores=args.target_num_cores,
         max_tokens=args.max_tokens,
         max_ngram_size=args.max_ngram_size,
+        lookahead_tokens=args.lookahead_tokens,
         qaic_debug=args.qaic_debug,
     )
