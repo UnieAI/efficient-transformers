@@ -34,6 +34,7 @@ from eagle_utils import (
     normalize_token_ids,
     select_last_hidden_states,
 )
+from prompt_lookup import find_candidate_pred_tokens
 
 
 def parse_device_group(value: str) -> List[int]:
@@ -122,6 +123,44 @@ def resolve_eagle_loop_names(session):
     return token_output, hidden_output, present_key, present_value
 
 
+def skip_unneeded_outputs(session: QAICInferenceSession, keep_outputs: List[str]) -> None:
+    output_names = set(session.output_names)
+    keep_set = set(keep_outputs)
+    skipped = [name for name in output_names if name not in keep_set and not name.endswith("_RetainedState")]
+    if skipped:
+        session.skip_buffers(skipped)
+
+
+def split_extra_outputs(session: QAICInferenceSession, keep_outputs: List[str]) -> List[str]:
+    keep_set = set(keep_outputs)
+    extra_outputs = []
+    for name in session.output_names:
+        if name in keep_set or name.endswith("_RetainedState"):
+            continue
+        binding = session.bindings[session.binding_index_map[name]]
+        if binding.is_partial_buf_allowed:
+            session.skip_buffers([name])
+        else:
+            extra_outputs.append(name)
+    return extra_outputs
+
+
+def build_output_buffers(
+    session: QAICInferenceSession,
+    vocab_size: int,
+    hidden_size: int,
+    num_logits_to_keep: int,
+    extra_output_names: List[str],
+) -> dict:
+    buffers = {}
+    logits_dtype = get_binding_dtype(session, "logits")
+    buffers["logits"] = np.zeros((1, num_logits_to_keep, vocab_size), dtype=logits_dtype)
+    for name in extra_output_names:
+        dtype = get_binding_dtype(session, name)
+        buffers[name] = np.zeros((1, num_logits_to_keep, hidden_size), dtype=dtype)
+    return buffers
+
+
 def eagle_spec_decode_inference(
     prompts,
     target_model_name,
@@ -202,6 +241,7 @@ def eagle_spec_decode_inference(
     print("Configuring target session buffers...")
     target_session.skip_buffers(set([x for x in target_session.input_names if x.startswith("past_")]))
     target_session.skip_buffers(set([x for x in target_session.output_names if x.endswith("_RetainedState")]))
+    extra_target_outputs = split_extra_outputs(target_session, ["logits", "hidden_states"])
     print("Target session ready.")
 
     if "hidden_states" not in target_session.output_names:
@@ -336,12 +376,15 @@ def eagle_spec_decode_inference(
     vocab_size = getattr(model_config, "vocab_size", len(tokenizer))
     hidden_dtype = get_binding_dtype(target_session, "hidden_states")
     logits_dtype = get_binding_dtype(target_session, "logits")
-    target_session.set_buffers(
-        {
-            "logits": np.zeros((1, 1, vocab_size), dtype=logits_dtype),
-            "hidden_states": np.zeros((1, 1, model_config.hidden_size), dtype=hidden_dtype),
-        }
+    prefill_buffers = build_output_buffers(
+        target_session,
+        vocab_size,
+        model_config.hidden_size,
+        num_logits_to_keep=1,
+        extra_output_names=extra_target_outputs,
     )
+    prefill_buffers["hidden_states"] = np.zeros((1, 1, model_config.hidden_size), dtype=hidden_dtype)
+    target_session.set_buffers(prefill_buffers)
 
     for prompt in prompts:
         print(f"\nPrompt: {prompt}")
@@ -493,12 +536,15 @@ def eagle_spec_decode_inference(
             if "attention_mask" in target_session.input_names:
                 verify_inputs["attention_mask"] = np.zeros((1, verify_len), dtype=np.int64)
                 verify_inputs["attention_mask"][0, : 1 + len(valid_draft)] = 1
-            target_session.set_buffers(
-                {
-                    "logits": np.zeros((1, verify_len, vocab_size), dtype=logits_dtype),
-                    "hidden_states": np.zeros((1, verify_len, model_config.hidden_size), dtype=hidden_dtype),
-                }
+            verify_buffers = build_output_buffers(
+                target_session,
+                vocab_size,
+                model_config.hidden_size,
+                num_logits_to_keep=verify_len,
+                extra_output_names=extra_target_outputs,
             )
+            verify_buffers["hidden_states"] = np.zeros((1, verify_len, model_config.hidden_size), dtype=hidden_dtype)
+            target_session.set_buffers(verify_buffers)
             verify_outs = target_session.run(verify_inputs)
             target_logits = verify_outs["logits"]
             target_tokens = target_logits.argmax(-1)[0]
@@ -551,10 +597,207 @@ def eagle_spec_decode_inference(
     return "Done"
 
 
+def ngram_spec_decode_inference(
+    prompts,
+    target_model_name,
+    num_speculative_tokens=3,
+    prefill_seq_len=128,
+    ctx_len=512,
+    device_group=None,
+    target_num_cores=14,
+    max_tokens=64,
+    max_ngram_size=3,
+    qaic_debug=False,
+):
+    device_group = device_group or [0]
+    print(f"Loading Target Model: {target_model_name}")
+    tokenizer = AutoTokenizer.from_pretrained(target_model_name)
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+
+    qaic_config = {"speculative_model_type": "target"}
+    target_model = AutoModelForCausalLM.from_pretrained(target_model_name, qaic_config=qaic_config)
+
+    core_candidates = [target_num_cores, 8, 6, 4, 2, 1]
+    core_candidates = [c for i, c in enumerate(core_candidates) if c > 0 and c <= target_num_cores]
+    core_candidates = [c for i, c in enumerate(core_candidates) if c not in core_candidates[:i]]
+
+    target_session = None
+    target_qpc = None
+    selected_target_cores = None
+    for num_cores in core_candidates:
+        print("Compiling Target Model...")
+        target_qpc = target_model.compile(
+            num_devices=len(device_group),
+            prefill_seq_len=prefill_seq_len,
+            ctx_len=ctx_len,
+            num_speculative_tokens=num_speculative_tokens,
+            aic_enable_depth_first=True,
+            num_cores=num_cores,
+        )
+        print("Creating target session...")
+        try:
+            target_session = QAICInferenceSession(
+                target_qpc,
+                device_ids=device_group,
+                enable_debug_logs=qaic_debug,
+            )
+            selected_target_cores = num_cores
+            break
+        except RuntimeError as exc:
+            msg = str(exc)
+            retryable = any(
+                token in msg
+                for token in (
+                    "Couldn't find a suitable device",
+                    "Not enough NSPs",
+                    "Failed to allocate NSP resources",
+                    "Failed to Load program",
+                )
+            )
+            print(f"Target session failed with num_cores={num_cores}: {exc}")
+            if not retryable or num_cores == core_candidates[-1]:
+                raise
+            print("Retrying with fewer target cores...")
+            continue
+
+    if target_session is None or target_qpc is None or selected_target_cores is None:
+        raise RuntimeError("Unable to create target session with available core configurations.")
+    print("Configuring target session buffers...")
+    target_session.skip_buffers(set([x for x in target_session.input_names if x.startswith("past_")]))
+    target_session.skip_buffers(set([x for x in target_session.output_names if x.endswith("_RetainedState")]))
+    extra_target_outputs = split_extra_outputs(target_session, ["logits"])
+    print("Target session ready.")
+
+    model_config = getattr(target_model, "config", None) or getattr(target_model, "model", None).config
+    vocab_size = getattr(model_config, "vocab_size", len(tokenizer))
+    logits_dtype = get_binding_dtype(target_session, "logits")
+    prefill_buffers = build_output_buffers(
+        target_session,
+        vocab_size,
+        model_config.hidden_size,
+        num_logits_to_keep=1,
+        extra_output_names=extra_target_outputs,
+    )
+    target_session.set_buffers(prefill_buffers)
+
+    for prompt in prompts:
+        print(f"\nPrompt: {prompt}")
+        input_len = tokenizer(prompt, return_tensors="np", padding=True).input_ids.shape[1]
+        input_len_padded = get_padded_input_len(input_len, prefill_seq_len, ctx_len)
+        inputs = tokenizer(prompt, return_tensors="np", padding="max_length", max_length=input_len_padded)
+        position_ids = np.where(inputs["attention_mask"], np.arange(input_len_padded), -1)
+        inputs["position_ids"] = position_ids
+        inputs["num_logits_to_keep"] = np.zeros((1, 1), dtype=np.int64)
+
+        target_outs = run_prefill_on_target(target_session, inputs, prefill_seq_len=prefill_seq_len)
+        if target_outs is None:
+            raise RuntimeError("Prefill produced no outputs. Check prefill_seq_len and input padding.")
+        target_logits = target_outs["logits"]
+        current_token = target_logits.argmax(2).astype(np.int64)
+        generated_ids = [current_token.item()]
+        prompt_ids = tokenizer(prompt, return_tensors="np").input_ids[0].tolist()
+        context_ids = prompt_ids + generated_ids
+        position_cursor = len(prompt_ids) + 1
+        total_draft_tokens = 0
+        accepted_draft_tokens = 0
+        verified_token_count = 0
+
+        verify_len = num_speculative_tokens + 1
+        verify_buffers = build_output_buffers(
+            target_session,
+            vocab_size,
+            model_config.hidden_size,
+            num_logits_to_keep=verify_len,
+            extra_output_names=extra_target_outputs,
+        )
+        target_session.set_buffers(verify_buffers)
+
+        while len(generated_ids) < max_tokens:
+            verify_seed_token = current_token.copy()
+            context_len = len(context_ids)
+            effective_ngram = min(max_ngram_size, max(1, context_len))
+            spec_tokens, has_empty_tokens = find_candidate_pred_tokens(
+                np.array([context_ids], dtype=np.int64),
+                fill_tok=-1,
+                max_ngram_size=effective_ngram,
+                num_pred_tokens=num_speculative_tokens,
+            )
+            draft_tokens = [] if has_empty_tokens else spec_tokens.tolist()
+            print(f" Drafted Tokens: {draft_tokens}")
+            if draft_tokens:
+                drafted_text = tokenizer.decode(draft_tokens, skip_special_tokens=False)
+                print(f" Drafted Text: {drafted_text!r}")
+            else:
+                print(" Drafted Text: ''")
+            total_draft_tokens += len(draft_tokens)
+            verify_inputs = {
+                "input_ids": np.zeros((1, verify_len), dtype=np.int64),
+                "position_ids": np.zeros((1, verify_len), dtype=np.int64),
+                "num_logits_to_keep": np.zeros((verify_len, 1), dtype=np.int64),
+            }
+            verify_inputs["input_ids"][0, 0] = verify_seed_token.item()
+            valid_draft = np.array(draft_tokens, dtype=np.int64)
+            max_draft = verify_len - 1
+            verify_inputs["input_ids"][0, 1 : 1 + len(valid_draft)] = valid_draft[:max_draft]
+            if len(valid_draft) < max_draft:
+                verify_inputs["input_ids"][0, 1 + len(valid_draft) :] = tokenizer.pad_token_id
+            verify_inputs["position_ids"][0] = -1
+            start_pos = position_cursor - 1
+            verify_inputs["position_ids"][0, : 1 + len(valid_draft)] = np.arange(
+                start_pos, start_pos + 1 + len(valid_draft), dtype=np.int64
+            )
+            if "attention_mask" in target_session.input_names:
+                verify_inputs["attention_mask"] = np.zeros((1, verify_len), dtype=np.int64)
+                verify_inputs["attention_mask"][0, : 1 + len(valid_draft)] = 1
+            verify_outs = target_session.run(verify_inputs)
+            target_logits = verify_outs["logits"]
+            target_tokens = target_logits.argmax(-1)[0]
+            draft_array = np.array(draft_tokens, dtype=np.int64)
+            matches = draft_array == target_tokens[: len(draft_array)]
+            accepted_draft = int(np.cumprod(matches).sum()) if matches.size else 0
+            accepted_count = min(accepted_draft + 1, 1 + len(draft_tokens))
+            remaining_quota = max_tokens - len(generated_ids)
+            accepted_count = min(accepted_count, remaining_quota)
+            verified_tokens = target_tokens[:accepted_count].tolist()
+            print(f" Verified Tokens: {verified_tokens}")
+            verified_text = tokenizer.decode(verified_tokens, skip_special_tokens=False)
+            print(f" Verified Text: {verified_text!r}")
+            print(f" Accepted draft tokens: {accepted_draft}/{len(draft_tokens)}")
+            accepted_draft_tokens += accepted_draft
+            verified_token_count += len(verified_tokens)
+
+            if not verified_tokens:
+                break
+            generated_ids.extend(verified_tokens)
+            context_ids.extend(verified_tokens)
+            position_cursor += len(verified_tokens)
+            current_token = np.array([[verified_tokens[-1]]], dtype=np.int64)
+            if len(generated_ids) >= max_tokens:
+                break
+
+        full_output_ids = tokenizer(prompt, return_tensors="np").input_ids[0].tolist() + generated_ids
+        full_text = tokenizer.decode(full_output_ids, skip_special_tokens=False)
+        print(f" Full Text: {full_text!r}")
+        if total_draft_tokens:
+            acceptance_rate = accepted_draft_tokens / total_draft_tokens
+            print(
+                " Summary: "
+                f"verified_tokens={verified_token_count}, "
+                f"draft_tokens={total_draft_tokens}, "
+                f"accepted_draft_tokens={accepted_draft_tokens}, "
+                f"acceptance_rate={acceptance_rate:.2%}"
+            )
+        else:
+            print(f" Summary: verified_tokens={verified_token_count}, draft_tokens=0")
+
+    return "Done"
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--target-model-name", type=str, default="meta-llama/Llama-3.2-1B")
-    parser.add_argument("--prompts", type=str, nargs="+", default=["Hello, my name is"])
+    parser.add_argument("--prompt", "--prompts", dest="prompts", type=str, nargs="+", default=["Hello, my name is"])
     parser.add_argument("--eagle-weights", type=str, default=None)
     parser.add_argument("--num-speculative-tokens", type=int, default=3)
     parser.add_argument("--prefill-seq-len", type=int, default=128)
@@ -569,25 +812,41 @@ if __name__ == "__main__":
     parser.add_argument("--eagle-use-cache", action="store_true")
     parser.add_argument("--eagle-cache-max-len", type=int, default=None)
     parser.add_argument("--eagle-on-device-loop", action="store_true")
+    parser.add_argument("--draft-method", choices=["eagle", "ngram"], default="eagle")
+    parser.add_argument("--max-ngram-size", type=int, default=3)
     parser.add_argument("--qaic-debug", action="store_true")
     args = parser.parse_args()
 
-    eagle_spec_decode_inference(
-        args.prompts,
-        args.target_model_name,
-        args.eagle_weights,
-        num_speculative_tokens=args.num_speculative_tokens,
-        prefill_seq_len=args.prefill_seq_len,
-        ctx_len=args.ctx_len,
-        device_group=parse_device_group(args.device_group),
-        eagle_device_group=parse_device_group(args.eagle_device_group) if args.eagle_device_group else None,
-        target_num_cores=args.target_num_cores,
-        eagle_num_cores=args.eagle_num_cores,
-        max_tokens=args.max_tokens,
-        eagle_window=args.eagle_window,
-        eagle_dtype=args.eagle_dtype,
-        eagle_use_cache=args.eagle_use_cache,
-        eagle_cache_max_len=args.eagle_cache_max_len,
-        eagle_on_device_loop=args.eagle_on_device_loop,
-        qaic_debug=args.qaic_debug,
-    )
+    if args.draft_method == "ngram":
+        ngram_spec_decode_inference(
+            args.prompts,
+            args.target_model_name,
+            num_speculative_tokens=args.num_speculative_tokens,
+            prefill_seq_len=args.prefill_seq_len,
+            ctx_len=args.ctx_len,
+            device_group=parse_device_group(args.device_group),
+            target_num_cores=args.target_num_cores,
+            max_tokens=args.max_tokens,
+            max_ngram_size=args.max_ngram_size,
+            qaic_debug=args.qaic_debug,
+        )
+    else:
+        eagle_spec_decode_inference(
+            args.prompts,
+            args.target_model_name,
+            args.eagle_weights,
+            num_speculative_tokens=args.num_speculative_tokens,
+            prefill_seq_len=args.prefill_seq_len,
+            ctx_len=args.ctx_len,
+            device_group=parse_device_group(args.device_group),
+            eagle_device_group=parse_device_group(args.eagle_device_group) if args.eagle_device_group else None,
+            target_num_cores=args.target_num_cores,
+            eagle_num_cores=args.eagle_num_cores,
+            max_tokens=args.max_tokens,
+            eagle_window=args.eagle_window,
+            eagle_dtype=args.eagle_dtype,
+            eagle_use_cache=args.eagle_use_cache,
+            eagle_cache_max_len=args.eagle_cache_max_len,
+            eagle_on_device_loop=args.eagle_on_device_loop,
+            qaic_debug=args.qaic_debug,
+        )
