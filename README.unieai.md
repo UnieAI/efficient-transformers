@@ -42,6 +42,19 @@ python examples/performance/speculative_decoding/ngram_inference.py \
   --target-num-cores 14 \
   --max-tokens 64
 ```
+
+## How to Run (QAIC N-gram Chat Completion)
+```bash
+python examples/performance/speculative_decoding/ngram_inference.py \
+  --target-model-name "meta-llama/Llama-3.2-1B" \
+  --messages '[{"role":"system","content":"You are a helpful assistant."},{"role":"user","content":"List colors of rainbow: red,"}]' \
+  --max-ngram-size 3 \
+  --lookahead-tokens 8 \
+  --num-speculative-tokens 4 \
+  --device-group "2" \
+  --target-num-cores 14 \
+  --max-tokens 64
+```
 注意：`--eagle-weights` 會自動對應本地 `./models/JKroller/llama3.2-1b-eagle/model.safetensors`。  
 如需指定其他位置，使用 `--eagle-weights /path/to/model.safetensors`。
 

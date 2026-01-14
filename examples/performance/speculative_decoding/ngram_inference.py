@@ -6,7 +6,8 @@
 # -----------------------------------------------------------------------------
 
 import argparse
-from typing import List
+import json
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 from transformers import AutoTokenizer
@@ -28,6 +29,57 @@ def get_padded_input_len(input_len: int, prefill_seq_len: int, ctx_len: int) -> 
     if input_len_padded > ctx_len:
         raise ValueError("input_len rounded to prefill_seq_len multiple must be <= ctx_len")
     return input_len_padded
+
+
+def format_chat_prompt(tokenizer: AutoTokenizer, messages: List[dict]) -> str:
+    if hasattr(tokenizer, "apply_chat_template"):
+        try:
+            return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        except Exception:
+            pass
+    lines = []
+    for msg in messages:
+        role = msg.get("role", "user")
+        content = msg.get("content", "")
+        lines.append(f"{role}: {content}")
+    lines.append("assistant:")
+    return "\n".join(lines)
+
+
+def parse_messages_arg(messages: Optional[str], messages_file: Optional[str]) -> Optional[List[Dict[str, Any]]]:
+    if messages and messages_file:
+        raise ValueError("Only one of --messages or --messages-file can be set.")
+    if messages_file:
+        with open(messages_file, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    elif messages:
+        payload = json.loads(messages)
+    else:
+        return None
+    if not isinstance(payload, list):
+        raise ValueError("messages must be a JSON array of objects with role/content.")
+    return payload
+
+
+def build_stop_token_ids(tokenizer: AutoTokenizer) -> set:
+    stop_ids = set()
+    for token_id in tokenizer.all_special_ids:
+        stop_ids.add(token_id)
+    for token_id in (tokenizer.bos_token_id, tokenizer.pad_token_id, tokenizer.unk_token_id):
+        if token_id is not None and token_id in stop_ids:
+            stop_ids.remove(token_id)
+    vocab = tokenizer.get_vocab()
+    for token in ("<|eot_id|>", "<|eom_id|>", "<|end_of_text|>", "<|endoftext|>"):
+        if token in vocab:
+            stop_ids.add(vocab[token])
+    return stop_ids
+
+
+def trim_on_stop(tokens: List[int], stop_ids: set) -> tuple[List[int], bool]:
+    for idx, token_id in enumerate(tokens):
+        if token_id in stop_ids:
+            return tokens[: idx + 1], True
+    return tokens, False
 
 
 def filter_inputs(session: QAICInferenceSession, inputs: dict) -> dict:
@@ -101,6 +153,7 @@ def ngram_spec_decode_inference(
     max_tokens=64,
     max_ngram_size=3,
     lookahead_tokens=0,
+    messages=None,
     qaic_debug=False,
 ):
     if lookahead_tokens and lookahead_tokens < num_speculative_tokens:
@@ -110,7 +163,7 @@ def ngram_spec_decode_inference(
     tokenizer = AutoTokenizer.from_pretrained(target_model_name)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
-    eos_token_id = tokenizer.eos_token_id
+    stop_token_ids = build_stop_token_ids(tokenizer)
 
     qaic_config = {"speculative_model_type": "target"}
     target_model = AutoModelForCausalLM.from_pretrained(target_model_name, qaic_config=qaic_config)
@@ -181,6 +234,9 @@ def ngram_spec_decode_inference(
 
     enable_lookahead = lookahead_tokens > 0
     lookahead_len = max(num_speculative_tokens, lookahead_tokens) if enable_lookahead else num_speculative_tokens
+
+    if messages:
+        prompts = [format_chat_prompt(tokenizer, messages)]
 
     for prompt in prompts:
         print(f"\nPrompt: {prompt}")
@@ -263,6 +319,11 @@ def ngram_spec_decode_inference(
             matches = draft_array == target_tokens[: len(draft_array)]
             accepted_draft = int(np.cumprod(matches).sum()) if matches.size else 0
             full_match = bool(draft_tokens) and accepted_draft == len(draft_tokens)
+            bonus_stop = False
+            if enable_lookahead and full_match and len(target_tokens) > len(draft_tokens):
+                bonus_token = target_tokens[len(draft_tokens)]
+                if bonus_token in stop_token_ids:
+                    bonus_stop = True
             # Lookahead decoding: skip the bonus token on full match to keep the draft buffer aligned.
             if enable_lookahead and full_match:
                 accepted_count = len(draft_tokens)
@@ -271,11 +332,8 @@ def ngram_spec_decode_inference(
             remaining_quota = max_tokens - len(generated_ids)
             accepted_count = min(accepted_count, remaining_quota)
             verified_tokens = target_tokens[:accepted_count].tolist()
-            stop_on_eos = False
-            if eos_token_id is not None and eos_token_id in verified_tokens:
-                eos_index = verified_tokens.index(eos_token_id) + 1
-                verified_tokens = verified_tokens[:eos_index]
-                stop_on_eos = True
+            verified_tokens, stop_on_eos = trim_on_stop(verified_tokens, stop_token_ids)
+            stop_on_eos = stop_on_eos or bonus_stop
             accepted_draft_tokens += accepted_draft
             verified_token_count += len(verified_tokens)
 
@@ -310,12 +368,12 @@ def ngram_spec_decode_inference(
             if len(generated_ids) >= max_tokens:
                 break
 
-        full_output_ids = tokenizer(prompt, return_tensors="np").input_ids[0].tolist() + generated_ids
-        full_text = tokenizer.decode(full_output_ids, skip_special_tokens=False)
-        print(f" Full Text: {full_text!r}")
+        assistant_text = tokenizer.decode(generated_ids, skip_special_tokens=True)
+        print(f" Assistant: {assistant_text!r}")
+        total_tokens = len(prompt_ids) + len(generated_ids)
         print(
             " Total output tokens: "
-            f"{len(full_output_ids)} (prompt={len(prompt_ids)}, generated={len(generated_ids)})"
+            f"{total_tokens} (prompt={len(prompt_ids)}, generated={len(generated_ids)})"
         )
         if total_draft_tokens:
             acceptance_rate = accepted_draft_tokens / total_draft_tokens
@@ -336,6 +394,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--target-model-name", type=str, default="meta-llama/Llama-3.2-1B")
     parser.add_argument("--prompt", "--prompts", dest="prompts", type=str, nargs="+", default=["Hello, my name is"])
+    parser.add_argument("--messages", type=str, default=None, help="Chat messages as JSON array")
+    parser.add_argument("--messages-file", type=str, default=None, help="Path to JSON file of chat messages")
     parser.add_argument("--num-speculative-tokens", type=int, default=3)
     parser.add_argument("--prefill-seq-len", type=int, default=128)
     parser.add_argument("--ctx-len", type=int, default=512)
@@ -352,6 +412,7 @@ if __name__ == "__main__":
     parser.add_argument("--qaic-debug", action="store_true")
     args = parser.parse_args()
 
+    messages = parse_messages_arg(args.messages, args.messages_file)
     ngram_spec_decode_inference(
         args.prompts,
         args.target_model_name,
@@ -363,5 +424,6 @@ if __name__ == "__main__":
         max_tokens=args.max_tokens,
         max_ngram_size=args.max_ngram_size,
         lookahead_tokens=args.lookahead_tokens,
+        messages=messages,
         qaic_debug=args.qaic_debug,
     )
