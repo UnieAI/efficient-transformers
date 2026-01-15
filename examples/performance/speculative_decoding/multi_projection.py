@@ -17,6 +17,13 @@ from QEfficient import QEFFAutoModelForCausalLM as AutoModelForCausalLM
 from QEfficient.generation.cloud_infer import QAICInferenceSession
 from QEfficient.utils.constants import Constants
 
+from pprint import pformat
+import logging
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
+logger = logging.getLogger("draft_model")
 
 @dataclass
 class SpDPerfMetrics:
@@ -348,11 +355,11 @@ def arg_parse():
     parser.add_argument(
         "--pretrained-model-name-or-path",
         type=str,
-        default="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+        default="Qwen/Qwen2.5-1.5B-Instruct",
         help="Target model name",
     )
     parser.add_argument("--full-batch-size", type=optional_int, default=None, help="Full batch size")
-    parser.add_argument("--device-group", type=comma_separated_ints, default="0", help="device QIDs")
+    parser.add_argument("--device-group", type=comma_separated_ints, default="1", help="device QIDs")
     parser.add_argument("--ignore-eos-token", action="store_true")
     args = parser.parse_args()
     return args

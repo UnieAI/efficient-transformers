@@ -9,6 +9,8 @@ from argparse import ArgumentParser
 from dataclasses import dataclass
 from time import perf_counter
 from typing import List, Optional, Union
+from pprint import pformat
+import logging
 
 import numpy as np
 from transformers import AutoTokenizer
@@ -16,6 +18,12 @@ from transformers import AutoTokenizer
 from QEfficient import QEFFAutoModelForCausalLM as AutoModelForCausalLM
 from QEfficient.generation.cloud_infer import QAICInferenceSession
 from QEfficient.utils.constants import Constants
+
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
+logger = logging.getLogger("draft_model")
 
 
 @dataclass
@@ -458,13 +466,13 @@ def arg_parse():
     parser.add_argument(
         "--target-device-group",
         type=comma_separated_ints,
-        default="0",
+        default="1",
         help="comma separated device QIDs (e.g., '1,2,3')",
     )
     parser.add_argument(
         "--draft-device-group",
         type=comma_separated_ints,
-        default="0",
+        default="1",
         help="comma separated device QIDs (e.g., '1,2,3')",
     )
     args = parser.parse_args()
