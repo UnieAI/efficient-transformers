@@ -450,6 +450,7 @@ class InferenceEngine:
         device_group: List[int] = None,
         full_batch_size: int = 8,
         prefill_bsz: int = 1,
+        num_sessions: int = 1,
     ):
         self.target_model_name = target_model_name
         self.prefill_seq_len = prefill_seq_len
@@ -459,6 +460,7 @@ class InferenceEngine:
         self.device_group = device_group or [0]
         self.full_batch_size = full_batch_size
         self.prefill_bsz = prefill_bsz
+        self.num_sessions = max(1, num_sessions)
         self.num_logits_to_keep = num_speculative_tokens + 1
         
         # Initialize tokenizer
@@ -470,13 +472,14 @@ class InferenceEngine:
         # Initialize model session
         self._init_model()
         
-        # Single-threaded executor to ensure sequential access to session
-        self._executor = ThreadPoolExecutor(max_workers=1)
+        # Executor for parallel session use
+        self._executor = ThreadPoolExecutor(max_workers=self.num_sessions)
     
     def _init_model(self):
         """Initialize the target model and session"""
         logger.info(f"Loading model: {self.target_model_name}")
         cache_path = Path(__file__).resolve().parent / ".qpc_cache.json"
+        num_cores = max(1, 16 // self.num_sessions)
         cache_key = "|".join(
             [
                 self.target_model_name,
@@ -485,7 +488,7 @@ class InferenceEngine:
                 f"spec={self.num_speculative_tokens}",
                 f"full_bsz={self.full_batch_size}",
                 f"num_devices={len(self.device_group)}",
-                "num_cores=16",
+                f"num_cores={num_cores}",
             ]
         )
 
@@ -514,7 +517,7 @@ class InferenceEngine:
 
             num_devices = len(self.device_group)
             qpc_path = target_model.compile(
-                num_cores=16,
+                num_cores=num_cores,
                 num_devices=num_devices,
                 prefill_seq_len=self.prefill_seq_len,
                 ctx_len=self.ctx_len,
@@ -532,23 +535,31 @@ class InferenceEngine:
             except (OSError, json.JSONDecodeError):
                 pass
 
-        self.session = QAICInferenceSession(qpc_path, device_ids=self.device_group)
-        
-        # Skip KV cache buffers
-        self.session.skip_buffers(
-            set([x for x in self.session.input_names if x.startswith("past_")])
-        )
-        self.session.skip_buffers(
-            set([x for x in self.session.output_names if x.endswith("_RetainedState")])
-        )
-        
-        # Pre-allocate buffers
-        self._prefill_logits_buffer = np.zeros(
-            (self.prefill_bsz, 1, self.vocab_size), dtype=np.float32
-        )
-        self._decode_logits_buffer = np.zeros(
-            (self.full_batch_size, self.num_logits_to_keep, self.vocab_size), dtype=np.float32
-        )
+        self.sessions = []
+        self._session_buffers = {}
+        self._session_queue: asyncio.Queue = asyncio.Queue()
+        for _ in range(self.num_sessions):
+            session = QAICInferenceSession(qpc_path, device_ids=self.device_group)
+
+            # Skip KV cache buffers
+            session.skip_buffers(
+                set([x for x in session.input_names if x.startswith("past_")])
+            )
+            session.skip_buffers(
+                set([x for x in session.output_names if x.endswith("_RetainedState")])
+            )
+
+            # Pre-allocate buffers per session
+            prefill_buffer = np.zeros(
+                (self.prefill_bsz, 1, self.vocab_size), dtype=np.float32
+            )
+            decode_buffer = np.zeros(
+                (self.full_batch_size, self.num_logits_to_keep, self.vocab_size), dtype=np.float32
+            )
+
+            self.sessions.append(session)
+            self._session_buffers[id(session)] = (prefill_buffer, decode_buffer)
+            self._session_queue.put_nowait(session)
         
         logger.info("Model loaded successfully")
     
@@ -615,7 +626,7 @@ class InferenceEngine:
 
         return np.full(num_pred_tokens, fill_tok, dtype=np.int64), True
     
-    def _run_prefill(self, inputs: dict, slot_idx: int) -> np.ndarray:
+    def _run_prefill(self, session: QAICInferenceSession, inputs: dict, slot_idx: int) -> np.ndarray:
         input_len = inputs["input_ids"].shape[1]
         num_chunks = input_len // self.prefill_seq_len
         cache_index = np.array([[0]], np.int64)
@@ -630,12 +641,18 @@ class InferenceEngine:
             chunk_inputs["position_ids"] = inputs["position_ids"][
                 :, cache_index[0, 0]: cache_index[0, 0] + self.prefill_seq_len
             ]
-            outputs = self.session.run(chunk_inputs)
+            outputs = session.run(chunk_inputs)
             cache_index += self.prefill_seq_len
 
         return outputs["logits"]
     
-    def _run_inference_sync(self, requests: List[InferenceRequest]) -> List[Dict]:
+    def _run_inference_sync(
+        self,
+        session: QAICInferenceSession,
+        prefill_buffer: np.ndarray,
+        decode_buffer: np.ndarray,
+        requests: List[InferenceRequest],
+    ) -> List[Dict]:
         """Synchronous inference - runs in thread pool"""
         actual_batch_size = len(requests)
         decode_batch_size = self.full_batch_size
@@ -688,9 +705,9 @@ class InferenceEngine:
         }
         
         # Run prefill for each slot
-        self.session.set_buffers({"logits": self._prefill_logits_buffer})
+        session.set_buffers({"logits": prefill_buffer})
         for bi in range(decode_batch_size):
-            logits = self._run_prefill(prompts_tokenized[bi], slot_idx=bi)
+            logits = self._run_prefill(session, prompts_tokenized[bi], slot_idx=bi)
             input_ids = logits.argmax(2).astype(np.int64)
             generated_ids[bi].append(input_ids.item())
             precode_inputs["input_ids"][bi, 0] = input_ids.item()
@@ -708,7 +725,7 @@ class InferenceEngine:
             prompt_plus_gen_idx[bi] = input_len + 1
         
         # Decode phase
-        self.session.set_buffers({"logits": self._decode_logits_buffer})
+        session.set_buffers({"logits": decode_buffer})
         
         valid_batch_indices = np.zeros(decode_batch_size, dtype=bool)
         valid_batch_indices[:actual_batch_size] = True
@@ -740,7 +757,7 @@ class InferenceEngine:
                     precode_inputs["input_ids"][bi, 1:] = spec_tokens
             
             # Run target model
-            outputs = self.session.run(precode_inputs)
+            outputs = session.run(precode_inputs)
             target_tokens = outputs["logits"].argmax(-1)
             
             # Verify predictions
@@ -817,12 +834,20 @@ class InferenceEngine:
     
     async def run_batch(self, requests: List[InferenceRequest]) -> List[Dict]:
         """Run inference - dispatches to thread pool"""
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(
-            self._executor,
-            self._run_inference_sync,
-            requests
-        )
+        session = await self._session_queue.get()
+        prefill_buffer, decode_buffer = self._session_buffers[id(session)]
+        try:
+            loop = asyncio.get_event_loop()
+            return await loop.run_in_executor(
+                self._executor,
+                self._run_inference_sync,
+                session,
+                prefill_buffer,
+                decode_buffer,
+                requests,
+            )
+        finally:
+            self._session_queue.put_nowait(session)
 
 
 # =============================================================================
@@ -837,6 +862,7 @@ def create_app(
     prefill_seq_len: int = 256,
     ctx_len: int = 1024,
     num_speculative_tokens: int = 3,
+    num_sessions: int = 1,
     device_group: List[int] = None,
 ) -> FastAPI:
     """Create and configure the FastAPI application"""
@@ -860,6 +886,7 @@ def create_app(
             prefill_seq_len=prefill_seq_len,
             ctx_len=ctx_len,
             num_speculative_tokens=num_speculative_tokens,
+            num_sessions=num_sessions,
             device_group=device_group or [0],
             full_batch_size=max_batch_size,
         )
@@ -1103,6 +1130,12 @@ def main():
         help="Number of speculative tokens",
     )
     parser.add_argument(
+        "--num-sessions",
+        type=int,
+        default=1,
+        help="Number of QAIC inference sessions to create",
+    )
+    parser.add_argument(
         "--device-group",
         type=str,
         default="0",
@@ -1120,6 +1153,7 @@ def main():
         prefill_seq_len=args.prefill_seq_len,
         ctx_len=args.ctx_len,
         num_speculative_tokens=args.num_speculative_tokens,
+        num_sessions=args.num_sessions,
         device_group=device_group,
     )
     
